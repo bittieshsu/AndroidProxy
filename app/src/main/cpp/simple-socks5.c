@@ -899,6 +899,7 @@ static void send_zero_reply(int client_fd, unsigned char rep) {
 typedef struct udp_conn_t {
     uint32_t magic;
     int slot;
+    int cmd;           // 建立時收到的 SOCKS5 指令（0x03 / 0x04）；只給診斷 log 用
     uint32_t gen;
     uint64_t ep_u64;
 
@@ -927,6 +928,13 @@ typedef struct udp_conn_t {
     uint32_t remote_events; // 5G remote UDP fd 的興趣遮罩（0x04 背壓時遮罩 EPOLLIN）
 
     int closed;
+    // [診斷] 拆除原因。由觸發拆除的那條路徑設定（一律指向字串常值，不涉所有權），
+    // 統一在 udp_conn_finalize 印一次。補這個洞的理由：先前**所有**拆除路徑都不留
+    // 任何痕跡，UDP-in-TCP 的會話反覆重建在伺服器端完全隱形，只能靠推測。
+    // close_reason == NULL 而 closed == 1 代表有路徑漏插樁 —— finalize 會單獨出聲。
+    const char *close_reason;
+    int close_errno;   // 伴隨 close_reason 的 errno（0 = 不適用）
+    time_t created;    // 建立時刻：用來判斷是「真實會話」還是「剛建立就被拆」
     atomic_int refs;
     atomic_int finalized;
     atomic_int registered;
@@ -1330,6 +1338,27 @@ static void udp_conn_finalize(udp_conn_t *u) {
         atomic_fetch_add(&g_udp_st_double_fin, 1);
         return;
     }
+    // [診斷] 每個 session 拆除時印一行，附原因與存活時間。先前這裡完全安靜，
+    // 客戶端反覆重建會話（例如 QUIC 首飛塞爆收緩衝那類問題）在伺服器端看不出來。
+    // 判讀：存活只有幾百毫秒且同一個 client_fd 反覆出現 = churn，不是正常收攤。
+    {
+        time_t now = time(NULL);
+        const char *mode = (u->cmd == 0x03) ? "0x03" : "0x04";
+        long lived = (long)(now - u->created);
+        long idle = (long)(now - u->last_active);
+        if (lived < 0) lived = 0;
+        if (idle < 0) idle = 0;
+        if (u->close_reason) {
+            LOGE("udp session 拆除: %s | mode=%s slot=%d client_fd=%d errno=%d(%s) 存活=%lds 閒置=%lds pend=%d",
+                 u->close_reason, mode, u->slot, u->client_fd, u->close_errno,
+                 u->close_errno ? strerror(u->close_errno) : "n/a",
+                 lived, idle, udp_dns_pend_count(u->pend, UDP_DNS_PEND_SLOTS));
+        } else if (u->closed) {
+            // 漏插樁會在這裡現形，不會再靜默
+            LOGE("udp session 拆除但無原因（漏插樁？）: mode=%s slot=%d client_fd=%d 存活=%lds",
+                 mode, u->slot, u->client_fd, lived);
+        }
+    }
     udp_worker_t *w = &udp_workers[u->widx];
     pthread_mutex_lock(&w->list_lock);
     if (u->next || u->prev || w->conn_list_head == u) {
@@ -1368,7 +1397,11 @@ static int udp_flush_out(udp_conn_t *u) {
         ssize_t n = send(u->client_fd, u->out_buf + u->out_off, u->out_len - u->out_off, MSG_NOSIGNAL);
         if (n > 0) { u->out_off += n; }
         else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        else return -1;
+        else {
+            u->close_reason = "0x04 出向 frame send() 到 client 失敗";
+            u->close_errno = errno;
+            return -1;
+        }
     }
     u->out_len = 0; u->out_off = 0;
     return 0;
@@ -1376,14 +1409,26 @@ static int udp_flush_out(udp_conn_t *u) {
 
 // 0x03：client 控制連線事件 → 偵測對端是否斷開。回傳 -1 = 關閉。
 static int udp_ctrl_event(udp_conn_t *u, uint32_t ev) {
-    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) return -1;
+    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        u->close_reason = "0x03 控制連線收到 ERR/HUP/RDHUP";
+        u->close_errno = 0;
+        return -1;
+    }
     if (ev & EPOLLIN) {
         // 控制連線理論上不承載資料；若客戶端送了就消費丟棄。不可用 MSG_PEEK——
         // 資料留著會讓 level-triggered EPOLLIN 永久就緒而熱迴圈。
         char tmp[256];
         ssize_t n = recv(u->client_fd, tmp, sizeof(tmp), 0);
-        if (n == 0) return -1;
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+        if (n == 0) {
+            u->close_reason = "0x03 控制連線被客戶端關閉 (EOF)";
+            u->close_errno = 0;
+            return -1;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            u->close_reason = "0x03 控制連線 recv 失敗";
+            u->close_errno = errno;
+            return -1;
+        }
     }
     return 0;
 }
@@ -1394,7 +1439,12 @@ static int udp_local_event(udp_conn_t *u) {
     for (;;) {
         tlen = sizeof(tmp);
         ssize_t r = recvfrom(u->local_udp_fd, u->in_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
-        if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            u->close_reason = "0x03 local UDP recvfrom 失敗";
+            u->close_errno = errno;
+            return -1;
+        }
         if (r <= 3) continue; // 連 RSV(2)+FRAG(1)+ATYP(1) 都湊不齊，丟棄
         unsigned char atyp; const unsigned char *addr; unsigned char port[2];
         int hlen = socks5_udp_parse(u->in_buf, (size_t)r, &atyp, &addr, port);
@@ -1419,7 +1469,12 @@ static int udp_remote_event(udp_conn_t *u) {
             sl = sizeof(src6);
             int off = 22; // 預留 IPv6 header
             ssize_t r = recvfrom(u->remote_udp_fd, u->in_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
-            if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                u->close_reason = "0x03 5G remote recvfrom 失敗";
+                u->close_errno = errno;
+                return -1;
+            }
             if (r == 0) continue;
             atomic_fetch_add(&g_udp_rx_bytes[u->widx], (long long)r);
             if (u->client_src_len > 0) {
@@ -1441,7 +1496,12 @@ static int udp_remote_event(udp_conn_t *u) {
             sl = sizeof(src6);
             int off = 2 + 22; // 2-byte frame 長度欄 + 22-byte IPv6 header
             ssize_t r = recvfrom(u->remote_udp_fd, u->out_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
-            if (r < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; return -1; }
+            if (r < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                u->close_reason = "0x04 5G remote recvfrom 失敗";
+                u->close_errno = errno;
+                return -1;
+            }
             if (r == 0) continue;
             atomic_fetch_add(&g_udp_rx_bytes[u->widx], (long long)r);
             const unsigned char *addr; int is_v6;
@@ -1477,21 +1537,41 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
             while (u->len_got < 2) {
                 ssize_t n = recv(u->client_fd, u->len_bytes + u->len_got, 2 - u->len_got, 0);
                 if (n > 0) { u->len_got += n; }
-                else if (n == 0) return -1;
+                else if (n == 0) {
+                    u->close_reason = "0x04 客戶端關閉（讀長度欄時 EOF）";
+                    u->close_errno = 0;
+                    return -1;
+                }
                 else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-                else return -1;
+                else {
+                    u->close_reason = "0x04 讀長度欄 recv 失敗";
+                    u->close_errno = errno;
+                    return -1;
+                }
             }
             int dlen = socks5_udp_tcp_frame_len(u->len_bytes, BUFFER_SIZE);
-            if (dlen < 0) return -1; // 協定違規：裝不下表頭或爆緩衝
+            if (dlen < 0) { // 協定違規：裝不下表頭或爆緩衝
+                u->close_reason = "0x04 frame 長度欄違規（超出 BUFFER_SIZE）";
+                u->close_errno = 0;
+                return -1;
+            }
             u->frame_expect = dlen;
             u->frame_got = 0;
         }
         while (u->frame_got < u->frame_expect) {
             ssize_t n = recv(u->client_fd, u->in_buf + u->frame_got, u->frame_expect - u->frame_got, 0);
             if (n > 0) { u->frame_got += n; }
-            else if (n == 0) return -1;
+            else if (n == 0) {
+                u->close_reason = "0x04 客戶端關閉（讀 frame body 時 EOF）";
+                u->close_errno = 0;
+                return -1;
+            }
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-            else return -1;
+            else {
+                u->close_reason = "0x04 讀 frame body recv 失敗";
+                u->close_errno = errno;
+                return -1;
+            }
         }
         // 完整 datagram 到手 → 解析並轉發 5G
         unsigned char atyp; const unsigned char *addr; unsigned char port[2];
@@ -1624,6 +1704,8 @@ static void* udp_worker_loop(void* arg) {
                     // [非同步解析] 有待補送的 frame 時同樣不可回收
                     udp_dns_pend_count(cur->pend, UDP_DNS_PEND_SLOTS) == 0 &&
                     udp_conn_idle_expired(now, cur->last_active, UDP_IDLE_TIMEOUT_SEC)) {
+                    cur->close_reason = "閒置逾時（超過 UDP_IDLE_TIMEOUT_SEC 無活動）";
+                    cur->close_errno = 0;
                     cur->closed = 1;
                     if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
                     if (cur->next) cur->next->prev = cur->prev;
@@ -1658,7 +1740,12 @@ exit_udp_worker:
             if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
             if (cur->next) cur->next->prev = cur->prev;
             cur->next = NULL; cur->prev = NULL;
-            if (cur->magic == UDP_CONN_MAGIC) { cur->closed = 1; collected[n++] = cur; }
+            if (cur->magic == UDP_CONN_MAGIC) {
+                cur->close_reason = "worker 退出（伺服器停止）";
+                cur->close_errno = 0;
+                cur->closed = 1;
+                collected[n++] = cur;
+            }
             cur = next;
         }
         pthread_mutex_unlock(&me->list_lock);
@@ -1681,6 +1768,7 @@ static void udp_start_session(int client_fd, int cmd) {
     // 讓客戶端 log 與診斷能分辨「伺服器忙碌」與「目標不可達」。
     if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
         atomic_fetch_sub(&g_conn_count, 1);
+        LOGE("udp session 建立被拒: 連線額度耗盡 (cmd=0x%02x client_fd=%d) → REP=0x01", cmd, client_fd);
         send_zero_reply(client_fd, 0x01);
         close(client_fd);
         return;
@@ -1688,12 +1776,14 @@ static void udp_start_session(int client_fd, int cmd) {
     int slot = udp_slot_acquire();
     if (slot < 0) {
         atomic_fetch_sub(&g_conn_count, 1);
+        LOGE("udp session 建立被拒: UDP 槽位耗盡 (cmd=0x%02x client_fd=%d) → REP=0x01", cmd, client_fd);
         send_zero_reply(client_fd, 0x01);
         close(client_fd);
         return;
     }
     udp_conn_t *u = &g_udp_slots[slot];
     u->magic = UDP_CONN_MAGIC;
+    u->cmd = cmd;
     u->client_fd = client_fd;
     u->local_udp_fd = -1;
     u->remote_udp_fd = -1;
@@ -1702,10 +1792,18 @@ static void udp_start_session(int client_fd, int cmd) {
     atomic_store(&u->refs, 1);
     atomic_store(&u->finalized, 0);
     atomic_store(&u->registered, 0);
+    u->close_reason = NULL;
+    u->close_errno = 0;
     u->last_active = time(NULL);
+    u->created = u->last_active;
     u->in_buf = malloc(BUFFER_SIZE + 64);
     u->out_buf = malloc(BUFFER_SIZE + 64);
-    if (!u->in_buf || !u->out_buf) { udp_conn_unref(u); return; }
+    if (!u->in_buf || !u->out_buf) {
+        u->close_reason = "session 建立失敗：緩衝配置失敗";
+        u->close_errno = 0;
+        udp_conn_unref(u);
+        return;
+    }
 
     if (cmd == 0x03) {
         // 標準 UDP ASSOCIATE：建立雙棧 local relay socket
@@ -1715,6 +1813,8 @@ static void udp_start_session(int client_fd, int cmd) {
         if (local_udp_fd < 0) {
             // [修正] 以前這裡直接收攤、不回應 → 客戶端 recv 只拿到 EOF 或等到逾時，
             // 分不清「伺服器拒絕」與「網路斷線」。先回覆再收攤。
+            u->close_reason = "0x03 session 建立失敗：local relay socket 建不起來";
+            u->close_errno = errno;
             send_zero_reply(client_fd, 0x01);
             udp_conn_unref(u);
             return;
@@ -1739,6 +1839,8 @@ static void udp_start_session(int client_fd, int cmd) {
         // 移到回覆之前，失敗才能誠實回 REP=0x04（host unreachable）。
         int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
         if (remote_udp_fd < 0) {
+            u->close_reason = "0x03 session 建立失敗：5G 出口 UDP socket 建不起來";
+            u->close_errno = errno;
             send_zero_reply(client_fd, 0x04);
             udp_conn_unref(u);
             return;
@@ -1781,6 +1883,8 @@ static void udp_start_session(int client_fd, int cmd) {
     } else { // 0x04 UDP-in-TCP
         int remote_udp_fd = request_java_5g_socket("", 0, 1);
         if (remote_udp_fd < 0) {
+            u->close_reason = "0x04 session 建立失敗：5G 出口 UDP socket 建不起來";
+            u->close_errno = errno;
             send_zero_reply(client_fd, 0x04);
             udp_conn_unref(u); // finalize 關 client_fd 並歸還額度
             return;
@@ -1800,6 +1904,8 @@ static void udp_start_session(int client_fd, int cmd) {
     // epoll 做 EPOLL_CTL_ADD（或註冊後無人 unref 而洩漏 session）。
     pthread_mutex_lock(&w->list_lock);
     if (atomic_load(&w->stopping)) {
+        u->close_reason = "session 建立時 worker 正在停止（未註冊）";
+        u->close_errno = 0;
         pthread_mutex_unlock(&w->list_lock);
         udp_conn_unref(u);
         return;
@@ -1825,6 +1931,8 @@ static void udp_start_session(int client_fd, int cmd) {
         reg_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->remote_udp_fd, &ev) == 0);
     }
     if (!reg_ok) {
+        u->close_reason = "session 建立失敗：epoll 註冊失敗";
+        u->close_errno = errno;
         u->closed = 1;
         if (u->prev) u->prev->next = u->next; else w->conn_list_head = u->next;
         if (u->next) u->next->prev = u->prev;
