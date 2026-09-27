@@ -1,0 +1,10 @@
+- Feat: UDP relay now accepts ATYP=0x03 (domain) frames — required when the client enables Remote DNS; these were silently dropped before, which killed all QUIC/UDP traffic
+- Fix: UDP domain resolution no longer blocks the worker event loop — a single 2s DNS timeout used to freeze every session on that worker (there are only 4)
+- Fix: failed UDP domain resolution is now counted and logged instead of vanishing silently (new dns counters: drop/qfull/jobfull/lost)
+- Fix: a running VPN no longer blocks startup by its mere presence — the cellular egress is now probed with a real bindSocket, so a per-app VPN that excludes this app works fine
+- Fix: a genuine cellular outage is no longer misreported as "blocked by VPN" (which used to disable auto-rebuild permanently)
+- Fix: BLOCKED_BY_VPN no longer triggers a rebuild loop — it is a configuration problem, restarting cannot fix it and only tears down live connections
+- Fix: UDP egress sockets now use the same 3 MB SO_RCVBUF/SO_SNDBUF as TCP, so QUIC bursts are no longer dropped in the kernel queue
+- Fix: the FAILED status and its error message now stay on screen instead of being overwritten by STOPPED within a single frame
+- Fix: UDP-in-TCP failure replies now send REP 0x01/0x04 and close the connection as RFC 1928 requires, instead of leaving the client guessing
+- Docs: document the UDP-in-TCP failure replies and the ATYP=0x03 requirement

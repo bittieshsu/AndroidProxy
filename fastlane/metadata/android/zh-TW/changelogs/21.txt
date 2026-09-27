@@ -1,0 +1,10 @@
+- 新增：UDP relay 支援 ATYP=0x03（網域）frame — 客戶端開啟 Remote DNS 時送的就是這種；舊版靜默丟棄，等於 QUIC／UDP 全滅
+- 修復：UDP 網域解析不再阻塞 worker 事件迴圈 — 舊版一次 2 秒 DNS 逾時就凍結該 worker 上所有 session（worker 只有 4 條）
+- 修復：UDP 網域解析失敗改為計數＋記錄，不再無聲消失（新增 dns 計數：drop/qfull/jobfull/lost）
+- 修復：不再因為「系統裡有 VPN」就拒絕啟動 — 改以實際 bindSocket 探測蜂巢式出口，per-app VPN 未包含本 App 時照常可用
+- 修復：5G 真的斷線不再被誤判為「被 VPN 阻擋」（舊版會因此永不自動重建）
+- 修復：BLOCKED_BY_VPN 不再觸發重建迴圈 — 那是設定問題，重啟解決不了，只會切斷既有連線
+- 修復：UDP 出口 socket 比照 TCP 使用 3MB SO_RCVBUF／SO_SNDBUF，QUIC 突發不再在核心佇列被丟棄
+- 修復：FAILED 狀態與錯誤訊息會留在畫面上，不再被 STOPPED 於同一個 frame 內蓋掉
+- 修復：UDP-in-TCP 失敗回覆改依 RFC 1928 送出 REP 0x01／0x04 並關閉連線，不再讓客戶端空等
+- 文件：補上 UDP-in-TCP 失敗回覆與 ATYP=0x03 的說明
