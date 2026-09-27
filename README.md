@@ -196,7 +196,18 @@ Client → Server: {0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0}   （SOCKS5 request，
 Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功回覆，BND 全 0）
 ```
 
-成功回覆後，同一條 TCP 連線雙向以 frame 承載 UDP datagram。若伺服器不支援 0x04，會回覆 REP≠0，客戶端應在同一條連線退回標準 `0x03`（UDP ASSOCIATE）。
+成功回覆後，同一條 TCP 連線雙向以 frame 承載 UDP datagram。
+
+若伺服器回覆 `REP≠0`（不支援 0x04，或**暫時拒絕**——例如連線額度／UDP slot 耗盡、5G UDP socket 建不起來），伺服器會依 RFC 1928 送完失敗回覆後**直接關閉該條 TCP 連線**。因此客戶端**必須另開一條新連線**再退回標準 `0x03`（UDP ASSOCIATE）；續用原連線只會拿到 EOF，而且那個失敗會被誤判成網路斷線，觸發客戶端不必要的自動重連。
+
+失敗回覆的 REP 語意：
+
+| REP | 意義 | 伺服器端情境 |
+|---|---|---|
+| `0x01` | general SOCKS server failure | 連線數達 `MAX_CONCURRENT_CONNS`，或 UDP slot 用盡（**伺服器資源耗盡**，非目標問題） |
+| `0x04` | host unreachable | 目標不可達，含 5G 出口 UDP socket 建置失敗 |
+
+客戶端宜把兩者都歸類為**伺服器端拒絕／忙碌**（協定層），而非網路層斷線。
 
 ### Frame 格式（雙向相同）
 
@@ -217,7 +228,9 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 ```
 
 - `RSV=0`、`FRAG=0`
-- `ATYP=0x01`（IPv4，表頭 10B）或 `ATYP=0x04`（IPv6，表頭 22B）；不支援網域 ATYP=0x03
+- `ATYP=0x01`（IPv4，表頭 10B）、`ATYP=0x04`（IPv6，表頭 22B）或 `ATYP=0x03`（網域，表頭 `4 + 1 + len + 2`，可變長）
+  - `ATYP=0x03` 是 RFC 1928 §7 明文允許的 —— UDP request header 的 `ATYP` 與 §5 的 TCP CONNECT 共用同一組定義（0x01/0x03/0x04）。5G-Proxy-Client 開啟 **Remote DNS** 時，客戶端手上只有 fake IP、真名必須由伺服器以**自身出口**解析，送出的就是網域 frame；只認 0x01/0x04 會讓這類 frame 被靜默丟棄（QUIC 等 UDP 全滅）
+  - 伺服器端以**蜂巢式網路**解析（`Socks5ProxyService.resolveWithCache`：IP 字面值快路徑 + 共用快取 + `DnsResolver` 逾時 + 併發背壓），**不走系統 `getaddrinfo`** —— 那會用預設網路，在 Pro 手機上可能繞回 VPN。解析結果有 60 秒 TTL 快取（`simple-socks5.c` 的 `resolve_domain_sockaddr`）；解析失敗則丟棄該 frame 並記錄 log
 - 伺服器收到 frame 後解析目標位址，以 5G socket `sendto`；收到 5G 回覆後以來源位址封裝為 frame 送回客戶端（v4-mapped 一律輸出 ATYP=0x01）
 
 ### 實作位置
@@ -227,6 +240,8 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 ### 搭配客戶端
 
 - 5G-Proxy-Client 勾選「UDP relay 走 TCP（UDP-in-TCP）」即使用本協定；對一般 SOCKS5 伺服器會自動退回標準協定，兩者皆可互通。
+- 客戶端開啟 **Remote DNS** 時，UDP frame 會帶 `ATYP=0x03`（網域），需要伺服器端配合解析 —— 見上方 Frame 格式第 3 點。
+- 退回標準 `0x03` 時客戶端會**重新建立一條連線**（本伺服器在回覆 `REP≠0` 後會關閉原連線），並把該次失敗歸類為協定層、**不觸發**自動重連看門狗。因此「勾了 UDP-in-TCP 就無法連線」在客戶端舊版是個會引發重啟迴圈的 bug；伺服器端的職責只有「誠實回覆 `REP≠0` 並關閉」。
 
 ---
 
@@ -234,7 +249,10 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 
 - **Release 版預設不簽名**：若要自行發布 APK，請在專案根目錄建立 `keystore.properties`（格式見下方），並準備一個正式 keystore；若沒有該檔案，Release 版會輸出未簽名的 APK，供 F-Droid 等第三方以自身金鑰簽署。
 - App 僅於「鎖定蜂巢狀網路」的狀態下運作，若沒有蜂巢狀訊號（無 SIM 卡）服務將無法啟動。
-- 代理監聽器只綁定 LAN 介面與本機 loopback；若同時想從 VPN 隧道存取代理，請改用熱點分享或 USB 分享。
+- **可與本機 VPN 同時運作，前提是本 App 被排除在 VPN 之外**：啟動時會實際嘗試把 Socket 綁定到蜂巢式出口（`Network.bindSocket`），**bind 成功才啟動**，失敗才拒絕並提示原因。「系統裡有 VPN」本身不再是拒絕啟動的理由 —— per-app VPN（split tunneling）未包含本 App 時，蜂巢式出口完全可用。
+  - 若本 App 被納入 VPN 隧道，`bindSocket` 會被系統以 `EPERM` 拒絕。此時請在 VPN 的「分應用 / 排除清單」中**排除本 App**（套件名 `com.tokyoxpa3.androidproxy`），而**不是**關閉 VPN —— 關掉 VPN 就等於放棄整個用途。
+  - 同機並存的實例：本 App 連著 Wi-Fi 提供 5G 代理時，同一支手機再跑 5G-Proxy-Client（伺服器位址填本 App 顯示的「Wi-Fi 代理」IP）並把本 App 排除在隧道外，即可讓手機自身的流量也走 5G。詳見 5G-Proxy-Client 的 `TUTORIAL.md`。
+  - 被 VPN 阻擋時（bind 被拒且蜂巢式仍經系統驗證可用）健康檢查會標示 `BLOCKED_BY_VPN` 並**刻意不自動重建** —— 重啟解決不了設定問題，只會陷入重啟迴圈；真正的斷線則仍走原本的「連續 3 次失敗自動重建」。
 - 專案包含 `local.properties`（SDK 路徑）與 `.gradle/`、`build/`、`.cxx/` 等產生目錄，這些已被 `.gitignore` 忽略，不會上傳。
 
 ## 網路使用說明

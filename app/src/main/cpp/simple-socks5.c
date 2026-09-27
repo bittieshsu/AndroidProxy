@@ -21,11 +21,14 @@
 #include "conn_state.h"
 #include "conn_forward.h"
 #include "udp_conn.h"
+#include "udp_dns.h"
 #include "ghost_purge.h"
 
 extern void jni_attach_thread();
 extern void jni_detach_thread();
 extern int request_java_5g_socket(const char* host, int port, int is_udp);
+// 以蜂巢式網路解析主機名（供 UDP relay 的 ATYP=0x03 網域 frame 使用）。
+extern int request_java_resolve_host(const char *host, char *out, size_t out_len);
 // [根因修復 v2] fromSocket() 是 dup 語意：C 與 Java 各持一個 fd 引用同一描述，
 // 釋放時必須「雙邊各關各的」——close() 關 C 的副本，release_java_socket() 讓
 // Java socket.close() 收掉原生引用。只關任一邊都會洩漏成 CLOSE_WAIT 幽靈。
@@ -42,7 +45,13 @@ extern void release_java_socket(int fd);
 // [Slot 修復] 槽位總數必須 > MAX_CONCURRENT_CONNS（握手 CAS 預佔額度後才取槽）
 #define CONN_SLOT_COUNT 1088
 #define IDLE_TIMEOUT_SEC 300
-#define UDP_IDLE_TIMEOUT_SEC 60 
+// [閒置逾時對齊] 5G-Proxy-Client 的 UDP 會話逾時是 330 秒（udp_state.h）。
+// 舊值 60 秒讓 Pro 單方面先拆線：udp_conn_finalize() 會 close(client_fd)，
+// 那條 TCP 正是 UDP-in-TCP 的資料連線 —— 任何 QUIC 流只要安靜 60 秒就被砍，
+// 客戶端還以為活著（330 秒才自己回收），下次寫入才拿到 EOF，整個 session 重建。
+// Cloudflare Turnstile「載入→等→送出→等」的節奏很容易超過 60 秒空檔。
+// 這裡刻意設得比客戶端長：Pro 的逾時只當「安全網」，正常收攤一律由客戶端驅動。
+#define UDP_IDLE_TIMEOUT_SEC 360
 /* CONN_MAGIC 已移至 conn_state.h（供純函式模組與本檔共用同一驗證值） */
 
 static atomic_int g_conn_count = 0;
@@ -766,6 +775,102 @@ static int build_sockaddr(unsigned char atyp, const unsigned char *addr, const u
     return -1;
 }
 
+// ================= ATYP=0x03（網域）解析 =================
+// UDP relay 的 datagram 依 RFC 1928 §7 允許 ATYP=0x03；5G-Proxy-Client 開啟
+// Remote DNS 時送出的正是網域 frame（它只知道 fake IP，真名只有這裡能解析）。
+// 解析一律走 Java 端 resolveWithCache（蜂巢式網路 + 共用快取 + DnsResolver 逾時），
+// 不用系統 getaddrinfo —— 那走預設網路，在 Pro 手機上可能繞回 VPN。
+// 這裡再放一層小型 TTL 快取：UDP 每個 datagram 都跨一次 JNI 太浪費，
+// 而 DNS 結果的壽命遠長於此；命中時完全不進 Java。
+//
+// [非同步化] 解析「不可以」在 UDP worker 的事件迴圈裡同步做 —— Java DnsResolver
+// 逾時上限 2 秒，一次逾時就凍結該 worker 上所有 session（worker 只有 4 條）。
+// 現在 worker 只查這個快取；未命中就交給專用解析執行緒（見下方
+// 「非同步網域解析」區塊），解析完成再喚醒 worker 補送暫存的 frame。
+#define DNS_RESOLVE_CACHE_SLOTS 64
+#define DNS_RESOLVE_TTL_SEC 60
+#define DNS_RESOLVE_HOST_MAX 256
+
+typedef struct {
+    char host[DNS_RESOLVE_HOST_MAX];
+    struct sockaddr_storage sa;
+    socklen_t sa_len;
+    time_t expire;
+    int used;
+} dns_resolve_entry_t;
+
+static dns_resolve_entry_t g_dns_cache[DNS_RESOLVE_CACHE_SLOTS];
+static pthread_mutex_t g_dns_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// 把 IP 字面值 + port 組成 sockaddr。成功回 0，失敗回 -1。
+static int sockaddr_from_ip_port(const char *ip, const unsigned char port[2],
+                                 struct sockaddr_storage *out, socklen_t *out_len) {
+    if (!ip || !ip[0] || !out || !out_len) return -1;
+    struct in6_addr a6;
+    struct in_addr a4;
+    if (inet_pton(AF_INET6, ip, &a6) == 1) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)out;
+        memset(s6, 0, sizeof(*s6));
+        s6->sin6_family = AF_INET6;
+        s6->sin6_addr = a6;
+        memcpy(&s6->sin6_port, port, 2);
+        *out_len = sizeof(*s6);
+        return 0;
+    }
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        struct sockaddr_in *s4 = (struct sockaddr_in *)out;
+        memset(s4, 0, sizeof(*s4));
+        s4->sin_family = AF_INET;
+        s4->sin_addr = a4;
+        memcpy(&s4->sin_port, port, 2);
+        *out_len = sizeof(*s4);
+        return 0;
+    }
+    return -1;
+}
+
+// 查 C 層 TTL 快取（線性掃 64 格，成本遠低於跨 JNI）。命中回 1 並寫入 out/out_len。
+static int dns_cache_lookup(const char *host, time_t now,
+                            struct sockaddr_storage *out, socklen_t *out_len) {
+    if (!host || !host[0]) return 0;
+    int hit = 0;
+    pthread_mutex_lock(&g_dns_cache_lock);
+    for (int i = 0; i < DNS_RESOLVE_CACHE_SLOTS; i++) {
+        dns_resolve_entry_t *e = &g_dns_cache[i];
+        if (e->used && e->expire > now && strcmp(e->host, host) == 0) {
+            memcpy(out, &e->sa, sizeof(*out));
+            *out_len = e->sa_len;
+            hit = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_dns_cache_lock);
+    return hit;
+}
+
+// 寫回 C 層 TTL 快取（無 LRU：優先挑空格或已過期，否則覆蓋最早到期者）。
+static void dns_cache_put(const char *host, const struct sockaddr_storage *sa,
+                          socklen_t sa_len, time_t now) {
+    if (!host || !host[0] || !sa) return;
+    pthread_mutex_lock(&g_dns_cache_lock);
+    int slot = 0;
+    for (int i = 0; i < DNS_RESOLVE_CACHE_SLOTS; i++) {
+        if (!g_dns_cache[i].used || g_dns_cache[i].expire <= now) { slot = i; break; }
+        if (g_dns_cache[i].expire < g_dns_cache[slot].expire) slot = i;
+    }
+    strncpy(g_dns_cache[slot].host, host, DNS_RESOLVE_HOST_MAX - 1);
+    g_dns_cache[slot].host[DNS_RESOLVE_HOST_MAX - 1] = '\0';
+    memcpy(&g_dns_cache[slot].sa, sa, sizeof(*sa));
+    g_dns_cache[slot].sa_len = sa_len;
+    g_dns_cache[slot].expire = now + DNS_RESOLVE_TTL_SEC;
+    g_dns_cache[slot].used = 1;
+    pthread_mutex_unlock(&g_dns_cache_lock);
+}
+
+// 依 ATYP 取得目的 sockaddr 的舊入口 udp_dst_sockaddr 已移除：
+// ATYP=0x03 現在走「快取或非同步解析」（見 udp_route_frame / udp_dns_defer），
+// 0x01/0x04 直接由 udp_route_frame 呼叫 build_sockaddr。
+
 /* 回覆 BND 為 0.0.0.0:0 的標準回覆（CONNECT 成功/失敗、UDP pool 滿、UDP-in-TCP）。
  * 回覆封裝抽至 socks5_encode_reply（純函式，host 可測），此處只帶入全 0 位址。 */
 static void send_zero_reply(int client_fd, unsigned char rep) {
@@ -827,6 +932,11 @@ typedef struct udp_conn_t {
     atomic_int registered;
     time_t last_active;
 
+    // [非同步解析] 網域 frame 在等解析結果時暫存在這裡，解析完成後由 worker
+    // 補送（見 udp_dns_defer / udp_dns_flush_pending）。只有 UDP worker 執行緒
+    // 會碰這個陣列，不需要額外鎖。
+    udp_dns_pend_t pend[UDP_DNS_PEND_SLOTS];
+
     struct udp_conn_t *next, *prev;
     int widx;
 } udp_conn_t;
@@ -837,6 +947,13 @@ typedef struct {
     udp_conn_t *conn_list_head;
     pthread_mutex_t list_lock;
     atomic_int stopping; // [關閉競態] 同 worker_t：退出時鎖內設 1
+
+    // [非同步解析] 本 worker 的解析工作槽，以及「解析完成」的喚醒管線。
+    // 背景執行緒寫完 job 後往 dns_wake_pipe[1] 丟一個位元組，worker 的 epoll
+    // 收到 UDP_EV_DNS_WAKE 就來取用。管線在執行緒起來之前建好。
+    udp_dns_job_t dns_jobs[UDP_DNS_JOB_COUNT];
+    int dns_wake_pipe[2];
+    time_t dns_fail_log_last; // 解析失敗 log 節流（每 60 秒最多一行）
 } udp_worker_t;
 
 static udp_worker_t udp_workers[UDP_WORKER_COUNT];
@@ -855,6 +972,317 @@ static atomic_llong g_udp_st_exhausted = 0, g_udp_st_double_fin = 0;
 // [流量統計] UDP per-worker tx/rx 位元組累加器（與 TCP 分開宣告，讀取時一併加總）。
 static atomic_llong g_udp_tx_bytes[UDP_WORKER_COUNT];
 static atomic_llong g_udp_rx_bytes[UDP_WORKER_COUNT];
+
+// ================= [非同步網域解析] 解析執行緒 + worker 端補送 =================
+// 背景：ATYP=0x03 的 frame 必須先解析成 IP 才能 sendto。舊版在 UDP worker 的
+// 事件迴圈裡「同步」呼叫 Java DnsResolver（逾時上限 2 秒），一次逾時就凍結該
+// worker 上所有 session —— QUIC 的 ACK 與重傳全部停擺（worker 只有 4 條）。
+// 而且解析失敗時整個 frame 被靜默丟棄（不計數、不記 log），客戶端送出的
+// datagram 永遠等不到回覆，上層只能一直重傳。
+//
+// 現在拆成三方：
+//   worker      ：查快取 → 未命中就佔 job 槽 + 排入佇列 + 暫存 frame → 立刻返回
+//   解析執行緒  ：專職做 JNI 解析（可以阻塞）→ 寫入 job → 喚醒 worker
+//   worker（被喚醒）：寫回快取 + 補送暫存 frame；失敗則記數並出聲
+
+#define UDP_DNS_RESOLVER_THREADS 4
+#define UDP_DNS_QUEUE_MAX 128
+
+// 前置宣告：udp_route_frame（先定義）會呼叫 udp_dns_defer（後定義）。
+// GCC 14 起 implicit-function-declaration 預設即為 error，不能省略。
+static void udp_dns_defer(udp_conn_t *u, const char *host, const unsigned char port[2],
+                          const unsigned char *payload, size_t plen);
+
+typedef struct {
+    int worker_idx;
+    int job_idx;
+    char host[UDP_DNS_HOST_MAX];
+} udp_dns_req_t;
+
+static udp_dns_req_t g_dns_queue[UDP_DNS_QUEUE_MAX];
+static int g_dns_q_head = 0, g_dns_q_tail = 0, g_dns_q_count = 0;
+static pthread_mutex_t g_dns_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_dns_q_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_dns_threads[UDP_DNS_RESOLVER_THREADS];
+static atomic_int g_dns_stop = 0;
+
+// [診斷] 非同步解析的可觀測計數。舊版解析失敗是完全靜默的，這裡讓它出聲。
+static atomic_llong g_dns_st_enqueued = 0; // 排入解析佇列
+static atomic_llong g_dns_st_ok = 0;       // 解析成功
+static atomic_llong g_dns_st_fail = 0;     // 解析失敗
+static atomic_llong g_dns_st_qfull = 0;    // 佇列滿 → 放棄解析
+static atomic_llong g_dns_st_jobfull = 0;  // job 槽用盡 → 放棄解析
+static atomic_llong g_dns_st_drop = 0;     // 未暫存而直接丟棄的 frame
+static atomic_llong g_dns_st_replay = 0;   // 解析完成後補送成功的 frame
+static atomic_llong g_dns_st_lost = 0;     // 解析完成但 session 已收攤，補送不掉
+static atomic_llong g_dns_report_at = 0;   // 上次彙總 log 的時間（節流用）
+static atomic_llong g_dns_report_sum = 0;  // 上次彙總時的計數總和（無變化就不印）
+
+static void udp_dns_wake_worker(int worker_idx) {
+    if (worker_idx < 0 || worker_idx >= UDP_WORKER_COUNT) return;
+    int fd = udp_workers[worker_idx].dns_wake_pipe[1];
+    if (fd < 0) return;
+    char b = 1;
+    ssize_t n = write(fd, &b, 1);
+    (void)n; // 管線已滿代表本來就有待處理的喚醒，忽略即可
+}
+
+// 把解析工作排入佇列。成功回 1，佇列滿回 0。
+static int udp_dns_enqueue(int worker_idx, int job_idx, const char *host) {
+    int ok = 0;
+    pthread_mutex_lock(&g_dns_q_lock);
+    if (g_dns_q_count < UDP_DNS_QUEUE_MAX) {
+        udp_dns_req_t *r = &g_dns_queue[g_dns_q_tail];
+        r->worker_idx = worker_idx;
+        r->job_idx = job_idx;
+        snprintf(r->host, sizeof r->host, "%s", host);
+        g_dns_q_tail = (g_dns_q_tail + 1) % UDP_DNS_QUEUE_MAX;
+        g_dns_q_count++;
+        ok = 1;
+        pthread_cond_signal(&g_dns_q_cond);
+    }
+    pthread_mutex_unlock(&g_dns_q_lock);
+    return ok;
+}
+
+// 專用解析執行緒。這裡「可以」阻塞 —— 它不服務任何 session 的轉發。
+static void *udp_dns_resolver_thread(void *arg) {
+    (void)arg;
+    jni_attach_thread();
+    for (;;) {
+        udp_dns_req_t req;
+        pthread_mutex_lock(&g_dns_q_lock);
+        while (g_dns_q_count == 0 && !atomic_load(&g_dns_stop)) {
+            pthread_cond_wait(&g_dns_q_cond, &g_dns_q_lock);
+        }
+        if (g_dns_q_count == 0) { // 停止旗標已設且佇列已排空
+            pthread_mutex_unlock(&g_dns_q_lock);
+            break;
+        }
+        req = g_dns_queue[g_dns_q_head];
+        g_dns_q_head = (g_dns_q_head + 1) % UDP_DNS_QUEUE_MAX;
+        g_dns_q_count--;
+        pthread_mutex_unlock(&g_dns_q_lock);
+
+        char ip[DNS_RESOLVE_HOST_MAX];
+        ip[0] = '\0';
+        int rc = request_java_resolve_host(req.host, ip, sizeof ip);
+
+        udp_dns_job_t *j = &udp_workers[req.worker_idx].dns_jobs[req.job_idx];
+        // j->ip 只需容納 IP 字面值（IPv6 最長 45 字元）。長度超出代表解析端回傳了
+        // 非預期內容 —— 寧可判失敗（下游 sockaddr_from_ip_port 也會再驗一次），
+        // 不要靜默截斷成一個看似合法、實則錯誤的位址。
+        if (rc == 0 && ip[0] && strlen(ip) < sizeof j->ip) {
+            snprintf(j->ip, sizeof j->ip, "%s", ip);
+            atomic_store_explicit(&j->state, UDP_DNS_DONE_OK, memory_order_release);
+            atomic_fetch_add(&g_dns_st_ok, 1);
+        } else {
+            atomic_store_explicit(&j->state, UDP_DNS_DONE_FAIL, memory_order_release);
+            atomic_fetch_add(&g_dns_st_fail, 1);
+        }
+        udp_dns_wake_worker(req.worker_idx);
+    }
+    jni_detach_thread();
+    return NULL;
+}
+
+static void udp_dns_resolvers_start(void) {
+    atomic_store(&g_dns_stop, 0);
+    pthread_mutex_lock(&g_dns_q_lock);
+    g_dns_q_head = g_dns_q_tail = g_dns_q_count = 0;
+    pthread_mutex_unlock(&g_dns_q_lock);
+    for (int i = 0; i < UDP_DNS_RESOLVER_THREADS; i++) {
+        g_dns_threads[i] = 0;
+        pthread_create(&g_dns_threads[i], NULL, udp_dns_resolver_thread, NULL);
+    }
+}
+
+// 必須在 join UDP worker「之前」呼叫：解析執行緒會往 worker 的喚醒管線寫位元組。
+static void udp_dns_resolvers_stop(void) {
+    atomic_store(&g_dns_stop, 1);
+    pthread_mutex_lock(&g_dns_q_lock);
+    pthread_cond_broadcast(&g_dns_q_cond);
+    pthread_mutex_unlock(&g_dns_q_lock);
+    for (int i = 0; i < UDP_DNS_RESOLVER_THREADS; i++) {
+        if (g_dns_threads[i]) { pthread_join(g_dns_threads[i], NULL); g_dns_threads[i] = 0; }
+    }
+}
+
+// ---------- worker 端 ----------
+
+// 以 5G socket 送出一筆 UDP payload。sendto 失敗只記 log，不視為致命。
+static void udp_send_5g(udp_conn_t *u, const unsigned char *payload, size_t plen,
+                        const struct sockaddr_storage *dst, socklen_t dlen) {
+    if (!u || u->remote_udp_fd < 0 || !payload || plen == 0) return;
+    ssize_t sent = sendto(u->remote_udp_fd, payload, plen, 0,
+                          (const struct sockaddr *)dst, dlen);
+    if (sent < 0) {
+        LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
+    } else if (sent > 0) {
+        atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
+    }
+}
+
+// 解析成功：把該 host 的暫存 frame 全部補送出去。
+// 只有 UDP worker 執行緒會呼叫，sessions 也只由本執行緒 unref；仍取 list_lock
+// 走訪，避免與握手執行緒的入鏈動作競態。sendto 是非阻塞 UDP，鎖內做無妨。
+static void udp_dns_flush_pending(udp_worker_t *w, const char *host,
+                                  const struct sockaddr_storage *dst, socklen_t dlen) {
+    pthread_mutex_lock(&w->list_lock);
+    for (udp_conn_t *cur = w->conn_list_head; cur; cur = cur->next) {
+        if (cur->magic != UDP_CONN_MAGIC) continue;
+        for (int i = 0; i < UDP_DNS_PEND_SLOTS; i++) {
+            udp_dns_pend_t *p = &cur->pend[i];
+            if (!p->used || strcmp(p->host, host) != 0) continue;
+            if (cur->closed || cur->remote_udp_fd < 0) {
+                atomic_fetch_add(&g_dns_st_lost, 1);
+            } else {
+                udp_send_5g(cur, p->payload, p->len, dst, dlen);
+                atomic_fetch_add(&g_dns_st_replay, 1);
+            }
+            p->used = 0;
+        }
+    }
+    pthread_mutex_unlock(&w->list_lock);
+}
+
+// 解析失敗（或結果不是 IP 字面值）：丟棄該 host 的暫存 frame 並記數。
+static void udp_dns_drop_pending(udp_worker_t *w, const char *host) {
+    pthread_mutex_lock(&w->list_lock);
+    for (udp_conn_t *cur = w->conn_list_head; cur; cur = cur->next) {
+        if (cur->magic != UDP_CONN_MAGIC) continue;
+        for (int i = 0; i < UDP_DNS_PEND_SLOTS; i++) {
+            udp_dns_pend_t *p = &cur->pend[i];
+            if (p->used && strcmp(p->host, host) == 0) {
+                p->used = 0;
+                atomic_fetch_add(&g_dns_st_drop, 1);
+            }
+        }
+    }
+    pthread_mutex_unlock(&w->list_lock);
+}
+
+// 被喚醒後取用已完成的解析：寫回快取、補送或丟棄暫存 frame、釋放 job 槽。
+static void udp_dns_drain(udp_worker_t *w) {
+    char sink[64];
+    while (read(w->dns_wake_pipe[0], sink, sizeof sink) > 0) { } // 清空喚醒位元組
+
+    time_t now = time(NULL);
+    for (int i = 0; i < UDP_DNS_JOB_COUNT; i++) {
+        udp_dns_job_t *j = &w->dns_jobs[i];
+        int st = atomic_load_explicit(&j->state, memory_order_acquire);
+        if (st != UDP_DNS_DONE_OK && st != UDP_DNS_DONE_FAIL) continue;
+
+        if (st == UDP_DNS_DONE_OK) {
+            struct sockaddr_storage dst;
+            socklen_t dlen = 0;
+            if (sockaddr_from_ip_port(j->ip, j->port, &dst, &dlen) == 0) {
+                dns_cache_put(j->host, &dst, dlen, now);
+                udp_dns_flush_pending(w, j->host, &dst, dlen);
+            } else {
+                LOGE("UDP relay: 解析結果不是 IP 字面值 host=%s got=%s", j->host, j->ip);
+                udp_dns_drop_pending(w, j->host);
+            }
+        } else {
+            // 失敗要出聲，但不能每個 frame 都印（QUIC 一秒可送數十個）
+            if (now - w->dns_fail_log_last >= 60) {
+                w->dns_fail_log_last = now;
+                LOGE("UDP relay: 網域解析失敗（蜂巢式）host=%s", j->host);
+            }
+            udp_dns_drop_pending(w, j->host);
+        }
+        atomic_store_explicit(&j->state, UDP_DNS_FREE, memory_order_release);
+    }
+}
+
+// 把一筆 SOCKS5 UDP payload 依 ATYP 送往 5G 出口。
+// ATYP=0x01/0x04 直接送；ATYP=0x03（網域）走快取或非同步解析。全程不阻塞。
+static void udp_route_frame(udp_conn_t *u, unsigned char atyp, const unsigned char *addr,
+                            const unsigned char port[2],
+                            const unsigned char *payload, size_t plen) {
+    if (atyp != SOCKS5_ATYP_DOMAIN) {
+        struct sockaddr_storage dst;
+        socklen_t dlen = 0;
+        if (build_sockaddr(atyp, addr, port, &dst, &dlen) == 0)
+            udp_send_5g(u, payload, plen, &dst, dlen);
+        return;
+    }
+
+    // socks5_udp_parse 對 0x03 回傳的 addr 指向長度欄：addr[0]=長度、addr+1 起為網域
+    int dl = addr[0];
+    if (dl <= 0 || dl >= UDP_DNS_HOST_MAX) return;
+    char host[UDP_DNS_HOST_MAX];
+    memcpy(host, addr + 1, (size_t)dl);
+    host[dl] = '\0';
+
+    struct sockaddr_storage dst;
+    socklen_t dlen = 0;
+    if (dns_cache_lookup(host, time(NULL), &dst, &dlen)) {
+        udp_send_5g(u, payload, plen, &dst, dlen);
+        return;
+    }
+    udp_dns_defer(u, host, port, payload, plen);
+}
+
+// 快取未命中：佔 job 槽 + 排入解析佇列 + 暫存 frame，然後立刻返回。
+// 真的放不下就丟棄本次 frame（上層 QUIC/TCP 會重傳）並記數 —— 絕不靜默。
+static void udp_dns_defer(udp_conn_t *u, const char *host, const unsigned char port[2],
+                          const unsigned char *payload, size_t plen) {
+    udp_worker_t *w = &udp_workers[u->widx];
+    int ji = udp_dns_job_find(w->dns_jobs, UDP_DNS_JOB_COUNT, host);
+    if (ji < 0) {
+        ji = udp_dns_job_alloc(w->dns_jobs, UDP_DNS_JOB_COUNT);
+        if (ji < 0) {
+            atomic_fetch_add(&g_dns_st_jobfull, 1);
+        } else {
+            udp_dns_job_t *j = &w->dns_jobs[ji];
+            snprintf(j->host, sizeof j->host, "%s", host);
+            memcpy(j->port, port, 2);
+            j->ip[0] = '\0';
+            atomic_store_explicit(&j->state, UDP_DNS_INFLIGHT, memory_order_release);
+            if (udp_dns_enqueue(u->widx, ji, host)) {
+                atomic_fetch_add(&g_dns_st_enqueued, 1);
+            } else {
+                // 佇列滿：立刻釋放槽位，退回「直接丟棄」
+                atomic_store_explicit(&j->state, UDP_DNS_FREE, memory_order_release);
+                atomic_fetch_add(&g_dns_st_qfull, 1);
+                ji = -1;
+            }
+        }
+    }
+
+    if (ji >= 0 && udp_dns_hold_ok(plen)) {
+        int pi = udp_dns_pend_free_slot(u->pend, UDP_DNS_PEND_SLOTS);
+        if (pi >= 0) {
+            udp_dns_pend_t *p = &u->pend[pi];
+            snprintf(p->host, sizeof p->host, "%s", host);
+            memcpy(p->port, port, 2);
+            p->len = plen;
+            memcpy(p->payload, payload, plen);
+            p->used = 1;
+            return; // 已暫存，等解析完成後補送
+        }
+    }
+    atomic_fetch_add(&g_dns_st_drop, 1);
+}
+
+// 週期性彙總（掛在 worker 的 5 秒清掃上）：有變化才印，避免淹掉 logcat。
+static void udp_dns_report_if_changed(void) {
+    time_t now = time(NULL);
+    if (now - (time_t)atomic_load(&g_dns_report_at) < 30) return;
+    long long sum = atomic_load(&g_dns_st_enqueued) + atomic_load(&g_dns_st_ok)
+                  + atomic_load(&g_dns_st_fail) + atomic_load(&g_dns_st_drop)
+                  + atomic_load(&g_dns_st_replay) + atomic_load(&g_dns_st_qfull)
+                  + atomic_load(&g_dns_st_jobfull) + atomic_load(&g_dns_st_lost);
+    if (sum == 0 || sum == atomic_load(&g_dns_report_sum)) return;
+    atomic_store(&g_dns_report_sum, sum);
+    atomic_store(&g_dns_report_at, (long long)now);
+    LOGI("udp dns: enq=%lld ok=%lld fail=%lld replay=%lld drop=%lld qfull=%lld jobfull=%lld lost=%lld",
+         atomic_load(&g_dns_st_enqueued), atomic_load(&g_dns_st_ok),
+         atomic_load(&g_dns_st_fail), atomic_load(&g_dns_st_replay),
+         atomic_load(&g_dns_st_drop), atomic_load(&g_dns_st_qfull),
+         atomic_load(&g_dns_st_jobfull), atomic_load(&g_dns_st_lost));
+}
 
 static void udp_slots_init(void) {
     for (int i = 0; i < UDP_SLOT_COUNT; i++) {
@@ -976,15 +1404,8 @@ static int udp_local_event(udp_conn_t *u) {
         if (hlen > 0) {
             u->client_src_addr = tmp;
             u->client_src_len = tlen;
-            struct sockaddr_storage dst_ss; socklen_t dlen;
-            if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && r > hlen) {
-                ssize_t sent = sendto(u->remote_udp_fd, u->in_buf + hlen, r - hlen, 0, (struct sockaddr*)&dst_ss, dlen);
-                if (sent < 0) {
-                    LOGE("UDP relay: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
-                } else if (sent > 0) {
-                    atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
-                }
-            }
+            if (r > hlen) udp_route_frame(u, atyp, addr, port,
+                                          u->in_buf + hlen, (size_t)(r - hlen));
         }
     }
 }
@@ -1075,16 +1496,9 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
         // 完整 datagram 到手 → 解析並轉發 5G
         unsigned char atyp; const unsigned char *addr; unsigned char port[2];
         int hlen = socks5_udp_parse(u->in_buf, (size_t)u->frame_expect, &atyp, &addr, port);
-        if (hlen > 0) {
-            struct sockaddr_storage dst_ss; socklen_t dlen;
-            if (build_sockaddr(atyp, addr, port, &dst_ss, &dlen) == 0 && u->frame_expect > hlen) {
-                ssize_t sent = sendto(u->remote_udp_fd, u->in_buf + hlen, u->frame_expect - hlen, 0, (struct sockaddr*)&dst_ss, dlen);
-                if (sent < 0) {
-                    LOGE("UDP-in-TCP: 5G sendto 失敗, errno=%d (%s)", errno, strerror(errno));
-                } else if (sent > 0) {
-                    atomic_fetch_add(&g_udp_tx_bytes[u->widx], (long long)sent);
-                }
-            }
+        if (hlen > 0 && u->frame_expect > hlen) {
+            udp_route_frame(u, atyp, addr, port, u->in_buf + hlen,
+                            (size_t)(u->frame_expect - hlen));
         }
         u->len_got = 0;
         u->frame_expect = 0;
@@ -1130,6 +1544,14 @@ static void* udp_worker_loop(void* arg) {
     struct epoll_event stop_ev; stop_ev.events = EPOLLIN; stop_ev.data.u64 = 0;
     epoll_ctl(me->epoll_fd, EPOLL_CTL_ADD, g_shutdown_pipe[0], &stop_ev);
 
+    // [非同步解析] 註冊「解析完成」喚醒管線（與 session 事件識別碼結構上不碰撞）
+    if (me->dns_wake_pipe[0] >= 0) {
+        struct epoll_event dns_ev;
+        dns_ev.events = EPOLLIN;
+        dns_ev.data.u64 = UDP_EV_DNS_WAKE;
+        epoll_ctl(me->epoll_fd, EPOLL_CTL_ADD, me->dns_wake_pipe[0], &dns_ev);
+    }
+
     while (atomic_load(&server_running)) {
         garbage_count = 0;
         int nfds = epoll_wait(me->epoll_fd, events, MAX_EVENTS, 2000);
@@ -1137,6 +1559,10 @@ static void* udp_worker_loop(void* arg) {
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.u64 == 0) goto exit_udp_worker; // shutdown pipe
+            if (udp_event_is_dns_wake(events[i].data.u64)) {   // 解析完成
+                udp_dns_drain(me);
+                continue;
+            }
 
             uint32_t sidx, egen; udp_fd_role_t role;
             udp_event_decode(events[i].data.u64, &sidx, &egen, &role);
@@ -1187,8 +1613,16 @@ static void* udp_worker_loop(void* arg) {
             udp_conn_t *cur = me->conn_list_head;
             while (cur) {
                 udp_conn_t *next = cur->next;
+                // [背壓不算閒置] 出向還有 frame 沒送完 = 這個 session 還欠客戶端資料。
+                // 舊版在 out_len > 0 時把 remote 的 EPOLLIN 遮掉（見 udp_update_events），
+                // last_active 因此不再前進，60 秒就被 GC 掉、連佇列內容一起丟掉。
+                if (cur->magic == UDP_CONN_MAGIC && !cur->closed && cur->out_len > 0) {
+                    cur->last_active = now;
+                }
                 if (cur->magic == UDP_CONN_MAGIC && !cur->closed &&
                     atomic_load(&cur->registered) &&
+                    // [非同步解析] 有待補送的 frame 時同樣不可回收
+                    udp_dns_pend_count(cur->pend, UDP_DNS_PEND_SLOTS) == 0 &&
                     udp_conn_idle_expired(now, cur->last_active, UDP_IDLE_TIMEOUT_SEC)) {
                     cur->closed = 1;
                     if (cur->prev) cur->prev->next = cur->next; else me->conn_list_head = cur->next;
@@ -1200,6 +1634,7 @@ static void* udp_worker_loop(void* arg) {
             }
             pthread_mutex_unlock(&me->list_lock);
             last_check = now;
+            udp_dns_report_if_changed();
         }
 
         for (int i = 0; i < garbage_count; i++) udp_conn_unref(garbage[i]);
@@ -1241,16 +1676,19 @@ exit_udp_worker:
 // 由握手執行緒呼叫：建立 UDP session（額度 → 槽位 → socket → 回覆 → 註冊）。
 // 所有失敗路徑都由 udp_conn_unref 的 finalize 負責關 fd 與歸還 g_conn_count 額度。
 static void udp_start_session(int client_fd, int cmd) {
+    // [修正] 額度／槽位耗盡原本回 REP=0x04（host unreachable）——那是在說「目標主機到不了」，
+    // 但這裡的實情是「伺服器自己沒資源了」。改用 0x01（general SOCKS server failure），
+    // 讓客戶端 log 與診斷能分辨「伺服器忙碌」與「目標不可達」。
     if (atomic_fetch_add(&g_conn_count, 1) >= MAX_CONCURRENT_CONNS) {
         atomic_fetch_sub(&g_conn_count, 1);
-        send_zero_reply(client_fd, 0x04);
+        send_zero_reply(client_fd, 0x01);
         close(client_fd);
         return;
     }
     int slot = udp_slot_acquire();
     if (slot < 0) {
         atomic_fetch_sub(&g_conn_count, 1);
-        send_zero_reply(client_fd, 0x04);
+        send_zero_reply(client_fd, 0x01);
         close(client_fd);
         return;
     }
@@ -1274,7 +1712,13 @@ static void udp_start_session(int client_fd, int cmd) {
         int local_udp_fd = socket(AF_INET6, SOCK_DGRAM, 0);
         int local_is_v6 = (local_udp_fd >= 0);
         if (!local_is_v6) local_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (local_udp_fd < 0) { udp_conn_unref(u); return; }
+        if (local_udp_fd < 0) {
+            // [修正] 以前這裡直接收攤、不回應 → 客戶端 recv 只拿到 EOF 或等到逾時，
+            // 分不清「伺服器拒絕」與「網路斷線」。先回覆再收攤。
+            send_zero_reply(client_fd, 0x01);
+            udp_conn_unref(u);
+            return;
+        }
         if (local_is_v6) {
             int v6only = 0;
             setsockopt(local_udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
@@ -1288,6 +1732,18 @@ static void udp_start_session(int client_fd, int cmd) {
             bind(local_udp_fd, (struct sockaddr*)&a4, sizeof(a4));
         }
         u->local_udp_fd = local_udp_fd;
+
+        // [修正] 先建好 5G 出口 socket，再回覆成功。舊順序是「先送 REP=0x00 才建」，
+        // 一旦建不起來（5G 掉了、Network 物件失效），客戶端已收到成功回覆，
+        // 整條會話就變成黑洞：伺服器不 relay、不記 log，客戶端也永遠不會重試。
+        // 移到回覆之前，失敗才能誠實回 REP=0x04（host unreachable）。
+        int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
+        if (remote_udp_fd < 0) {
+            send_zero_reply(client_fd, 0x04);
+            udp_conn_unref(u);
+            return;
+        }
+        u->remote_udp_fd = remote_udp_fd;
 
         // BND.ADDR 取控制連線的本地（伺服器端）位址，BND.PORT 取 local relay port
         struct sockaddr_storage local_ss; socklen_t local_len = sizeof(local_ss);
@@ -1318,10 +1774,6 @@ static void udp_start_session(int client_fd, int cmd) {
             resp_len = socks5_encode_reply(resp, 0x00, 0, zero4, zero2);
         }
         send(client_fd, resp, resp_len, MSG_NOSIGNAL);
-
-        int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
-        if (remote_udp_fd < 0) { udp_conn_unref(u); return; }
-        u->remote_udp_fd = remote_udp_fd;
 
         // 控制連線 peer（來源驗證用）
         u->peer_ss_len = sizeof(u->peer_ss);
@@ -1750,8 +2202,30 @@ static void* listener_task(void* arg) {
         udp_workers[i].conn_list_head = NULL;
         atomic_store(&udp_workers[i].stopping, 0);
         pthread_mutex_init(&udp_workers[i].list_lock, NULL);
+        // [非同步解析] 喚醒管線與 job 表必須在執行緒起來「之前」備妥：
+        // worker 一啟動就會把管線註冊進 epoll，且會直接讀 dns_jobs 的狀態。
+        udp_workers[i].dns_wake_pipe[0] = -1;
+        udp_workers[i].dns_wake_pipe[1] = -1;
+        udp_workers[i].dns_fail_log_last = 0;
+        for (int k = 0; k < UDP_DNS_JOB_COUNT; k++) {
+            udp_workers[i].dns_jobs[k].state = UDP_DNS_FREE;
+            udp_workers[i].dns_jobs[k].host[0] = '\0';
+            udp_workers[i].dns_jobs[k].ip[0] = '\0';
+        }
+        int wp[2] = {-1, -1};
+        if (pipe(wp) == 0) {
+            // 讀端必須非阻塞：udp_dns_drain 用「讀到 EAGAIN」當作排空條件
+            set_nonblocking(wp[0]);
+            set_nonblocking(wp[1]);
+            udp_workers[i].dns_wake_pipe[0] = wp[0];
+            udp_workers[i].dns_wake_pipe[1] = wp[1];
+        } else {
+            LOGE("udp dns: 喚醒管線建立失敗，worker %d 將退回同步語意", i);
+        }
         pthread_create(&udp_workers[i].thread_id, NULL, udp_worker_loop, &udp_workers[i]);
     }
+    // 解析執行緒：worker 都起來之後才啟動，避免喚醒寫到還沒註冊的管線
+    udp_dns_resolvers_start();
 
     struct pollfd pfds[MAX_LISTENERS + 1];
     while (atomic_load(&server_running)) {
@@ -1822,6 +2296,19 @@ int socks5_server_get_stats(char *out, size_t out_len) {
     return 0;
 }
 
+// [非同步解析] 讀取解析診斷計數。供 App 內「複製診斷報告」與 host 整合測試判讀
+// 「解析有沒有在出聲」—— 舊版解析失敗是完全靜默的，這個計數就是那個缺口的補丁。
+int socks5_server_get_dns_stats(char *out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    snprintf(out, out_len,
+             "enq=%lld ok=%lld fail=%lld replay=%lld drop=%lld qfull=%lld jobfull=%lld lost=%lld",
+             atomic_load(&g_dns_st_enqueued), atomic_load(&g_dns_st_ok),
+             atomic_load(&g_dns_st_fail), atomic_load(&g_dns_st_replay),
+             atomic_load(&g_dns_st_drop), atomic_load(&g_dns_st_qfull),
+             atomic_load(&g_dns_st_jobfull), atomic_load(&g_dns_st_lost));
+    return 0;
+}
+
 // [流量統計] 讀取累計 tx/rx 位元組數（跨 TCP + UDP 所有 worker 加總）。server
 // 未啟動或參數非法回傳 -1；否則回傳 0 並寫入 *tx / *rx（未啟動時兩者皆為 0）。
 int socks5_server_get_bytes(long long *tx, long long *rx) {
@@ -1861,6 +2348,12 @@ int socks5_server_main_dynamic(int port) {
         atomic_store(&g_udp_tx_bytes[i], 0);
         atomic_store(&g_udp_rx_bytes[i], 0);
     }
+    // [非同步解析] 每個服務週期重置診斷計數（logcat 軌跡對應當次執行）
+    atomic_store(&g_dns_st_enqueued, 0); atomic_store(&g_dns_st_ok, 0);
+    atomic_store(&g_dns_st_fail, 0); atomic_store(&g_dns_st_qfull, 0);
+    atomic_store(&g_dns_st_jobfull, 0); atomic_store(&g_dns_st_drop, 0);
+    atomic_store(&g_dns_st_replay, 0); atomic_store(&g_dns_st_lost, 0);
+    atomic_store(&g_dns_report_at, 0); atomic_store(&g_dns_report_sum, 0);
     ListenerArgs *args = malloc(sizeof(ListenerArgs));
     args->port = port;
     pthread_create(&listener_thread, NULL, listener_task, args);
@@ -1888,9 +2381,14 @@ void socks5_server_quit(void) {
     // 若先 join/destroy worker 再排水，等同對已銷毀的 mutex 上鎖（UB）
     job_pool_shutdown(&g_handshake_pool);
     // [P2] UDP worker 取代 g_udp_pool；shutdown pipe 已喚醒它們，此處 join 收尾
+    // [非同步解析] 必須先停掉解析執行緒：它們會往 worker 的喚醒管線寫位元組，
+    // 若 worker 已 join、管線已關，那個 fd 可能已被重用（寫到別人的 fd）。
+    udp_dns_resolvers_stop();
     for (int i = 0; i < UDP_WORKER_COUNT; i++) {
         pthread_join(udp_workers[i].thread_id, NULL);
         pthread_mutex_destroy(&udp_workers[i].list_lock);
+        if (udp_workers[i].dns_wake_pipe[0] >= 0) { close(udp_workers[i].dns_wake_pipe[0]); udp_workers[i].dns_wake_pipe[0] = -1; }
+        if (udp_workers[i].dns_wake_pipe[1] >= 0) { close(udp_workers[i].dns_wake_pipe[1]); udp_workers[i].dns_wake_pipe[1] = -1; }
     }
     for (int i = 0; i < WORKER_COUNT; i++) {
         pthread_join(workers[i].thread_id, NULL);

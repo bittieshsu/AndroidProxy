@@ -45,11 +45,13 @@ int socks5_is_supported_cmd(int cmd);
 #define SOCKS5_ATYP_IPV6   0x04
 
 /* 解析 UDP datagram 表頭。dgram 為完整 datagram（含 DATA 尾），len 為其總長。
- * 驗證 RSV=0、FRAG=0、ATYP∈{IPv4,IPv6}，且長度足以容納表頭（不含 DATA）。
+ * 驗證 RSV=0、FRAG=0、ATYP∈{IPv4,DOMAIN,IPv6}，且長度足以容納表頭（不含 DATA）。
  * 成功回傳表頭長度（payload 起始偏移，>0）；違規回傳 -1。
- * 輸出 *atyp（0x01/0x04）、*addr（指向 dgram 內的位址位元組，IPv4=4B/IPv6=16B）、
- * port[2]（原始 2 位元組網路序，直接 memcpy 進 sin_port 即可）。
- * ATYP=DOMAIN 依 RFC 1928 不允許於 UDP datagram，回 -1。 */
+ * 輸出 *atyp（0x01/0x03/0x04）、*addr、port[2]（原始 2 位元組網路序，直接 memcpy
+ * 進 sin_port 即可）。*addr 的語意隨 atyp 而定：
+ *   0x01 → 指向 4B IPv4；0x04 → 指向 16B IPv6；
+ *   0x03 → 指向長度欄（addr[0]=網域長度，addr+1 起為網域位元組）。
+ * ATYP=0x03 於 UDP request header 是 RFC 1928 §7 明文允許的（呼叫端負責解析）。 */
 int socks5_udp_parse(const unsigned char *dgram, size_t len,
                      unsigned char *atyp, const unsigned char **addr, unsigned char port[2]);
 
@@ -65,7 +67,9 @@ int socks5_udp_encode(unsigned char *out, int is_v6, const unsigned char *addr, 
 void socks5_addr_normalize(const unsigned char *src, int is_v6, unsigned char *out16);
 
 /* SOCKS5 回覆封裝：寫 [VER=0x05][REP][RSV=0x00][ATYP][ADDR][PORT] 至 out，
- * 回傳表頭長度（IPv4=10、IPv6=22）。rep 為回覆碼（0x00 成功 / 0x04 等失敗）。
+ * 回傳表頭長度（IPv4=10、IPv6=22）。rep 為回覆碼：0x00 成功；
+ * 0x01 = general server failure（本伺服器用於**資源耗盡**：連線數或 UDP slot 用盡）；
+ * 0x04 = host unreachable（目標不可達，含 5G 出口 socket 建置失敗）。
  * is_v6=0 時 addr 為 4B，否則 16B；port[2] 為 2 位元組網路序。 */
 int socks5_encode_reply(unsigned char *out, unsigned char rep, int is_v6,
                         const unsigned char *addr, const unsigned char port[2]);

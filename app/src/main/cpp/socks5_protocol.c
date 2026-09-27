@@ -54,7 +54,21 @@ int socks5_udp_parse(const unsigned char *dgram, size_t len,
         if (port) memcpy(port, dgram + 20, 2);
         return 22;
     }
-    return -1; /* DOMAIN 或其他 ATYP：UDP datagram 不允許 */
+    if (t == SOCKS5_ATYP_DOMAIN) {
+        /* RFC 1928 §7 的 UDP request header 明文允許 ATYP=0x03（網域）。
+         * 舊版在此直接回 -1（註解誤稱「UDP datagram 不允許」），導致 5G-Proxy-Client
+         * 開啟 Remote DNS 時送出的網域 frame 被靜默丟棄（QUIC 等 UDP 全滅）。
+         * 表頭：4 + 長度欄(1) + 網域(dl) + port(2)。 */
+        if (len < 5) return -1; /* 連長度欄都讀不到 */
+        unsigned char dl = dgram[4];
+        if (dl == 0) return -1; /* 空網域：無意義且無法解析 */
+        if (len < (size_t)5 + (size_t)dl + 2) return -1; /* 網域或 port 不完整 */
+        if (atyp) *atyp = t;
+        if (addr) *addr = dgram + 4; /* 指向長度欄：addr[0]=dl、addr+1 起為網域 */
+        if (port) memcpy(port, dgram + 5 + dl, 2);
+        return 5 + (int)dl + 2;
+    }
+    return -1; /* 其他 ATYP：不支援 */
 }
 
 /* 寫入 [ATYP][ADDR][PORT] 至 p（p[0]=ATYP），回傳 7（v4）或 19（v6）bytes。

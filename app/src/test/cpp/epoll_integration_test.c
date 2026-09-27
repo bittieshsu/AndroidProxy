@@ -27,6 +27,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
+#include <stdatomic.h>
 
 // ---------- 公開 API（定義於 simple-socks5.c） ----------
 extern void socks5_server_set_auth(const char *user, const char *pass);
@@ -35,11 +36,13 @@ extern int  socks5_server_main_dynamic(int port);
 extern int  socks5_server_is_running(void);
 extern int  socks5_server_get_stats(char *out, size_t out_len);
 extern int  socks5_server_get_bytes(long long *tx, long long *rx);
+extern int  socks5_server_get_dns_stats(char *out, size_t out_len);
 extern void socks5_server_quit(void);
 
 // ---------- 測試參數 ----------
 #define PROXY_PORT 21080
 #define ECHO_PORT  21081
+#define UDP_ECHO_PORT 21082
 #define CHURN_THREADS 8
 #define CHURN_ITER     30
 
@@ -89,6 +92,25 @@ int request_java_5g_socket(const char *host, int port, int is_udp) {
         return fd;
     }
     return host_connect(host, port);
+}
+
+// ---------- request_java_resolve_host 的 host 替代 ----------
+// 真實裝置上這會走 Java 的 DnsResolver（蜂巢式網路 + 共用快取 + 逾時）。
+// host 測試用「可控延遲的假解析」取代，才能驗證 UDP worker 在解析期間沒有被阻塞。
+static atomic_int g_resolve_delay_ms = 0;   // 每次解析的人為延遲
+static atomic_int g_resolve_calls = 0;      // 解析被呼叫的次數（驗證去重）
+static char g_resolve_fail_host[128] = {0}; // 指定這個 host 一律解析失敗
+
+int request_java_resolve_host(const char *host, char *out, size_t out_len) {
+    atomic_fetch_add(&g_resolve_calls, 1);
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+    int d = atomic_load(&g_resolve_delay_ms);
+    if (d > 0) usleep((useconds_t)d * 1000);
+    if (g_resolve_fail_host[0] && strcmp(host, g_resolve_fail_host) == 0) return -1;
+    // 測試用的假 DNS：任何網域都指向 loopback，於是「5G 出口」就是本機的 UDP echo。
+    snprintf(out, out_len, "%s", "127.0.0.1");
+    return 0;
 }
 
 // ---------- echo server（CONNECT 的目標） ----------
@@ -266,12 +288,122 @@ static long long stat_field(const char *s, const char *key) {
     return v;
 }
 
+// ================= UDP-in-TCP（cmd=0x04）整合測試素材 =================
+//
+// 目的：鎖住「UDP worker 不得被網域解析阻塞」這個回歸。
+// 舊版在 worker 的事件迴圈裡同步呼叫 Java DnsResolver（逾時上限 2 秒），一次逾時
+// 就凍結該 worker 上所有 session —— 這正是 Cloudflare Turnstile 卡住的根因。
+// 新版的判別性探針是：同一條 0x04 session 上「先送一個網域 frame（會觸發解析延遲）、
+// 緊接著送一個 IP 字面值 frame」，兩者一次寫入。若 worker 仍會阻塞，第二個 frame
+// 的回覆必然被第一個的解析延遲拖住；非同步則幾乎立刻回覆。
+
+static void *udp_echo_server(void *arg) {
+    (void)arg;
+    int srv = socket(AF_INET, SOCK_DGRAM, 0);
+    if (srv < 0) { perror("udp echo socket"); return NULL; }
+    int opt = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(UDP_ECHO_PORT);
+    if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        perror("udp echo bind");
+        close(srv);
+        return NULL;
+    }
+    while (!g_echo_stop) {
+        struct pollfd pfd = { srv, POLLIN, 0 };
+        if (poll(&pfd, 1, 100) <= 0) continue;
+        char buf[2048];
+        struct sockaddr_storage from;
+        socklen_t fl = sizeof(from);
+        ssize_t n = recvfrom(srv, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+        if (n <= 0) continue;
+        sendto(srv, buf, (size_t)n, 0, (struct sockaddr *)&from, fl);
+    }
+    close(srv);
+    return NULL;
+}
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// 開一條 UDP-in-TCP(0x04) session：握手(無認證) → cmd=0x04 → 期待 REP=0x00。
+static int udp_in_tcp_open(void) {
+    int c = connect_proxy_retry();
+    if (c < 0) return -1;
+    unsigned char buf[16];
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
+    if (send(c, buf, 3, 0) != 3) goto fail;
+    if (recv(c, buf, 2, MSG_WAITALL) != 2) goto fail;
+    if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
+    buf[0] = 0x05; buf[1] = 0x04; buf[2] = 0x00; buf[3] = 0x01;
+    buf[4] = 0; buf[5] = 0; buf[6] = 0; buf[7] = 0; buf[8] = 0; buf[9] = 0;
+    if (send(c, buf, 10, 0) != 10) goto fail;
+    if (recv(c, buf, 10, MSG_WAITALL) != 10) goto fail;
+    if (buf[0] != 0x05 || buf[1] != 0x00) goto fail;
+    return c;
+fail:
+    close(c);
+    return -1;
+}
+
+// 組一個 UDP-in-TCP frame：2-byte 長度欄 + SOCKS5 UDP datagram。
+// addr 對 0x01/0x04 是 IP 位元組；對 0x03 是「長度 + 網域」。
+static int udp_build_frame(unsigned char *out, size_t cap, int atyp,
+                           const unsigned char *addr, int addr_len,
+                           int port, const char *payload, int plen) {
+    int dlen = 3 + 1 + addr_len + 2 + plen; // RSV(2)+FRAG(1)+ATYP(1)+ADDR+PORT(2)+DATA
+    if (dlen < 0 || (size_t)dlen + 2 > cap) return -1;
+    out[0] = (unsigned char)(dlen >> 8);
+    out[1] = (unsigned char)(dlen & 0xFF);
+    unsigned char *p = out + 2;
+    p[0] = 0x00; p[1] = 0x00; p[2] = 0x00; p[3] = (unsigned char)atyp;
+    memcpy(p + 4, addr, (size_t)addr_len);
+    p[4 + addr_len]     = (unsigned char)(port >> 8);
+    p[4 + addr_len + 1] = (unsigned char)(port & 0xFF);
+    memcpy(p + 4 + addr_len + 2, payload, (size_t)plen);
+    return dlen + 2;
+}
+
+// 收一個 UDP-in-TCP frame（先 2-byte 長度、再 body）。成功回 body 長度，逾時/錯誤回 -1。
+static int udp_recv_frame(int fd, unsigned char *body, size_t cap, int timeout_ms) {
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (poll(&pfd, 1, timeout_ms) <= 0) return -1;
+    unsigned char lb[2];
+    if (recv(fd, lb, 2, MSG_WAITALL) != 2) return -1;
+    int dlen = (lb[0] << 8) | lb[1];
+    if (dlen <= 0 || (size_t)dlen > cap) return -1;
+    if (recv(fd, body, dlen, MSG_WAITALL) != dlen) return -1;
+    return dlen;
+}
+
+// 從 SOCKS5 UDP datagram 取出 payload 起點與長度；成功回長度，格式錯誤回 -1。
+static int udp_frame_payload(const unsigned char *body, int dlen, const unsigned char **payload) {
+    if (dlen < 4) return -1;
+    int atyp = body[3], hl;
+    if (atyp == 0x01)      hl = 4 + 4 + 2;
+    else if (atyp == 0x04) hl = 4 + 16 + 2;
+    else if (atyp == 0x03) hl = 4 + 1 + body[4] + 2;
+    else return -1;
+    if (hl > dlen) return -1;
+    *payload = body + hl;
+    return dlen - hl;
+}
+
 int main(void) {
     int failed = 0;
 
-    // 1. 起 echo server
+    // 1. 起 echo server（TCP 供 CONNECT 用；UDP 供 UDP-in-TCP 用）
     pthread_t echo_tid;
     pthread_create(&echo_tid, NULL, echo_server, NULL);
+    pthread_t udp_echo_tid;
+    pthread_create(&udp_echo_tid, NULL, udp_echo_server, NULL);
 
     // 2. 起代理（只綁 loopback）
     const char *addrs[] = { "127.0.0.1" };
@@ -329,6 +461,100 @@ int main(void) {
                 failed = 1;
             }
         }
+    }
+
+    // 4c. [非同步解析回歸] UDP-in-TCP 的網域 frame 不得阻塞 UDP worker。
+    //
+    // 判別性探針：同一條 0x04 session 上一次寫入兩個 frame ——
+    //   frame A：ATYP=0x03 網域（觸發解析，人為延遲 RESOLVE_DELAY_MS）
+    //   frame B：ATYP=0x01 IP 字面值（不需要解析）
+    // 非同步版：B 的回覆幾乎立刻到（worker 只把 A 丟進佇列就繼續跑）。
+    // 同步版（舊行為）：worker 卡在 A 的解析上，B 的回覆要等 RESOLVE_DELAY_MS 才出現。
+    // 因此「B 的回覆是否早於延遲」就是區分新舊行為的唯一判據。
+    {
+        const int RESOLVE_DELAY_MS = 1200;
+        atomic_store(&g_resolve_delay_ms, RESOLVE_DELAY_MS);
+        atomic_store(&g_resolve_calls, 0);
+
+        int c = udp_in_tcp_open();
+        if (c < 0) {
+            fprintf(stderr, "FAIL: 0x04 UDP-in-TCP handshake\n");
+            failed = 1;
+        } else {
+            unsigned char out[512];
+            const char *host = "slow.example";
+            int hl = (int)strlen(host);
+            unsigned char hostaddr[1 + 32];
+            hostaddr[0] = (unsigned char)hl;
+            memcpy(hostaddr + 1, host, (size_t)hl);
+            unsigned char ip4[4] = { 127, 0, 0, 1 };
+
+            int fa = udp_build_frame(out, sizeof out, 0x03, hostaddr, 1 + hl,
+                                     UDP_ECHO_PORT, "A", 1);
+            int fb = (fa > 0)
+                   ? udp_build_frame(out + fa, sizeof out - (size_t)fa, 0x01, ip4, 4,
+                                     UDP_ECHO_PORT, "B", 1)
+                   : -1;
+            if (fa < 0 || fb < 0 ||
+                send(c, out, (size_t)(fa + fb), 0) != fa + fb) {
+                fprintf(stderr, "FAIL: 送 UDP-in-TCP frame (fa=%d fb=%d)\n", fa, fb);
+                failed = 1;
+            } else {
+                unsigned char body[256];
+                long long t0 = now_ms();
+                int d1 = udp_recv_frame(c, body, sizeof body, 5000);
+                long long elapsed = now_ms() - t0;
+                const unsigned char *pl = NULL;
+                int pl1 = (d1 > 0) ? udp_frame_payload(body, d1, &pl) : -1;
+
+                if (pl1 != 1 || pl[0] != 'B') {
+                    // 若這裡拿到 'A'，代表 worker 先處理完網域 frame 才輪到 IP frame。
+                    fprintf(stderr, "FAIL: 首個回覆不是 IP 字面值 frame (d=%d pl=%d%s)\n",
+                            d1, pl1, (pl1 == 1 && pl) ? (pl[0] == 'A' ? " 收到A" : "") : "");
+                    failed = 1;
+                } else if (elapsed >= RESOLVE_DELAY_MS / 2) {
+                    fprintf(stderr, "FAIL: IP 字面值 frame 被解析阻塞 %lldms (>= %dms)\n",
+                            elapsed, RESOLVE_DELAY_MS / 2);
+                    failed = 1;
+                } else {
+                    printf("PASS: 解析期間 UDP worker 未被阻塞（IP frame 回覆 %lldms < %dms）\n",
+                           elapsed, RESOLVE_DELAY_MS / 2);
+                }
+
+                // 網域 frame 的補送回覆：解析完成後才該出現，內容必須正確
+                int d2 = udp_recv_frame(c, body, sizeof body, 5000);
+                const unsigned char *pl2 = NULL;
+                int pl2len = (d2 > 0) ? udp_frame_payload(body, d2, &pl2) : -1;
+                if (pl2len != 1 || pl2[0] != 'A') {
+                    fprintf(stderr, "FAIL: 網域 frame 未被補送 (d=%d pl=%d)\n", d2, pl2len);
+                    failed = 1;
+                } else {
+                    printf("PASS: 網域 frame 解析後補送成功\n");
+                }
+            }
+            close(c);
+        }
+
+        // 診斷計數：解析有出聲、補送有發生、且沒有靜默丟棄。
+        // 舊版「解析失敗 → 整個 frame 靜默丟棄」正是驗證頁卡死時完全沒有線索的原因。
+        char ds[256] = { 0 };
+        socks5_server_get_dns_stats(ds, sizeof ds);
+        printf("dns stats: %s (resolve_calls=%d)\n", ds, atomic_load(&g_resolve_calls));
+        long long enq     = stat_field(ds, "enq");
+        long long replay  = stat_field(ds, "replay");
+        long long drop    = stat_field(ds, "drop");
+        long long qfull   = stat_field(ds, "qfull");
+        long long jobfull = stat_field(ds, "jobfull");
+        long long lost    = stat_field(ds, "lost");
+        if (enq < 1)     { fprintf(stderr, "FAIL: dns enq=%lld\n", enq);         failed = 1; }
+        if (replay < 1)  { fprintf(stderr, "FAIL: dns replay=%lld\n", replay);   failed = 1; }
+        if (drop != 0)   { fprintf(stderr, "FAIL: dns drop=%lld\n", drop);       failed = 1; }
+        if (qfull != 0)  { fprintf(stderr, "FAIL: dns qfull=%lld\n", qfull);     failed = 1; }
+        if (jobfull != 0){ fprintf(stderr, "FAIL: dns jobfull=%lld\n", jobfull); failed = 1; }
+        if (lost != 0)   { fprintf(stderr, "FAIL: dns lost=%lld\n", lost);       failed = 1; }
+        if (failed == 0) printf("PASS: dns 計數乾淨（enq=%lld replay=%lld drop=0）\n", enq, replay);
+
+        atomic_store(&g_resolve_delay_ms, 0);
     }
 
     // 5. 高併發 churn
@@ -400,6 +626,7 @@ int main(void) {
     socks5_server_quit();
     g_echo_stop = 1;
     pthread_join(echo_tid, NULL);
+    pthread_join(udp_echo_tid, NULL);
 
     if (failed) {
         fprintf(stderr, "RESULT: FAIL\n");

@@ -10,6 +10,9 @@ import android.content.Intent
 import android.os.IBinder
 import android.util.Log
 import android.content.SharedPreferences
+import com.tokyoxpa3.androidproxy.network.NetworkHealthClassifier
+import com.tokyoxpa3.androidproxy.network.NetworkHealthStatus
+import com.tokyoxpa3.androidproxy.network.VpnDetector
 import kotlinx.coroutines.*
 import java.io.Closeable
 
@@ -201,6 +204,14 @@ class Socks5ProxyService : Service() {
         // [偵測落檔] 生命週期計數器滾動落檔上限（超過則砍半保留最新）
         private const val STATS_LOG_MAX_BYTES = 64L * 1024
         private const val STATS_LOG_KEEP_BYTES = 32L * 1024
+
+        // [socket 緩衝] 出向 socket 的 SO_RCVBUF/SO_SNDBUF 目標值。
+        // 實測（小米 Pad Mini / Android 15）：net.core.rmem_max = wmem_max = 8 MB，
+        // 但 rmem_default = wmem_default 只有 224 KB —— UDP relay 的 worker 一次只
+        // 讀一個 datagram 再寫給 client，QUIC 的突發（例如 Turnstile 載入挑戰頁時
+        // 一次數十個 datagram）很容易在 kernel 佇列就被丟掉，接著就是重傳與卡頓。
+        // 3 MB 與 TCP 出口一致，且遠低於 8 MB 上限（kernel 會把值加倍後套用）。
+        private const val SOCKET_BUFFER_BYTES = 3 * 1024 * 1024
         @Volatile var isServiceRunning = false
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
@@ -325,6 +336,7 @@ class Socks5ProxyService : Service() {
                 // 啟動協程開始執行時可能已收到停止指令（stopProxy 的旗標先於本協程設定），
                 // 立即退出，避免把 UI 已顯示「已停止」的狀態又翻回運行中
                 if (stopRequested) { stopSelf(); return@launch }
+
                 isProxyRunning = true
                 // [重建迴圈修復] 先開始長期請求並監控：startMonitoring 用 requestNetwork
                 // 把蜂巢式 PDN 在服務期間 pin 住，避免「一次性 request 拿到就放掉」造成
@@ -338,9 +350,34 @@ class Socks5ProxyService : Service() {
                 val network = networkManager.currentNetwork()
                 if (network == null) { failStop(getString(R.string.error_cellular_unavailable)); return@launch }
                 cellularNetwork = network
+
+                // [VPN 判定改為實測] 舊版只要「系統裡存在任何 VPN 網路」就拒絕啟動。
+                // 但 VPN 存在 ≠ 它接管了本 App 的路由：per-app VPN（split tunneling）
+                // 未包含本 App 時，蜂巢式出口綁定完全可用，拿「存在」當前提會誤殺可用的設定。
+                // 改成直接做那個真正會失敗的動作 —— bindSocket —— 失敗才拒絕；
+                // 「有沒有 VPN」只用來決定把原因歸給誰（純措辭，不影響是否啟動）。
+                if (!canBindCellularEgress(network)) {
+                    failStop(
+                        if (VpnDetector.isVpnActive(connectivityManager)) {
+                            getString(R.string.error_vpn_running)
+                        } else {
+                            getString(R.string.error_cellular_bind_denied)
+                        }
+                    )
+                    return@launch
+                }
                 
                 NativeEngine.socketProvider = { host, p, isUdp -> 
                     createSocketBoundToNetwork(host, p, isUdp) 
+                }
+                // [UDP 網域 frame] UDP relay 收到 ATYP=0x03（5G-Proxy-Client 開 Remote DNS
+                // 時送的就是這種）需要「以蜂巢式網路」解析。直接重用 CONNECT 路徑同一套
+                // resolveWithCache：IP 字面值快路徑、共用快取、DnsResolver 逾時、併發背壓。
+                // 不走系統 getaddrinfo —— 那會用預設網路，在 Pro 手機上可能繞回 VPN。
+                // 快取命中是常態（同一網域多半已由 TCP CONNECT 解析過）；回 null 則該 frame 丟棄。
+                NativeEngine.hostResolver = { host ->
+                    val net = cellularNetwork
+                    if (net == null) null else resolveWithCache(net, host).firstOrNull()?.hostAddress
                 }
                 NativeEngine.registerInstance()
 
@@ -391,17 +428,32 @@ class Socks5ProxyService : Service() {
                                 lastHealthCheck = "WAITING_NETWORK"
                                 continue
                             }
-                            if (isNetworkHealthy(currentNetwork)) {
-                                consecutiveFailures = 0
-                                lastHealthCheck = "OK"
-                            } else {
-                                consecutiveFailures++
-                                lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
-                                Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
-                                if (consecutiveFailures >= 3) {
-                                    Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
-                                    restartProxy(port)
-                                    break
+                            when (checkNetworkHealth(currentNetwork)) {
+                                NetworkHealthStatus.OK -> {
+                                    consecutiveFailures = 0
+                                    lastHealthCheck = "OK"
+                                }
+                                NetworkHealthStatus.BLOCKED_BY_VPN -> {
+                                    // 被 VPN 阻擋（設定問題：本 App 被納入 VPN 隧道）：切勿觸發 restartProxy！
+                                    // 重啟無法解決設定問題，且會陷入無限重啟迴圈並切斷所有既有連線。
+                                    // 註：能走到這一支，代表 bind 探測失敗且蜂巢式仍被系統驗證可用
+                                    // （VALIDATED）—— 這是 NetworkHealthClassifier 判定「真的被擋」
+                                    // 的完整條件；缺任何一項都會落到 NETWORK_DEAD 走重建。
+                                    consecutiveFailures = 0
+                                    lastHealthCheck = "BLOCKED_BY_VPN"
+                                    Log.w(TAG, "健康檢查判定為被 VPN 阻擋（蜂巢式出口 bind 被拒且網路仍有效）；跳過自動重啟，請將本 App 排除在 VPN 之外")
+                                    val nm = getSystemService(NotificationManager::class.java)
+                                    nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.status_proxy_running), getString(R.string.notification_vpn_warning)))
+                                }
+                                NetworkHealthStatus.NETWORK_DEAD -> {
+                                    consecutiveFailures++
+                                    lastHealthCheck = "FAILED (${consecutiveFailures}/3)"
+                                    Log.w(TAG, "5G 網路健康檢查失敗 (${consecutiveFailures}/3)，準備自動重建...")
+                                    if (consecutiveFailures >= 3) {
+                                        Log.w(TAG, "5G 網路連續異常，自動重建代理連線...")
+                                        restartProxy(port)
+                                        break
+                                    }
                                 }
                             }
                         }
@@ -560,23 +612,67 @@ class Socks5ProxyService : Service() {
         "http://connect.rom.miui.com/generate_204"
     )
 
-    private fun isNetworkHealthy(network: android.net.Network): Boolean {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        val caps = cm.getNetworkCapabilities(network)
-        if (caps == null || !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+    /**
+     * 只做 bindSocket、不做連線：驗證系統肯不肯把這個網路當成本 App 的出口。
+     *
+     * 刻意不順便做連通性探測 —— 那會把「地區性被封鎖的探測端點」變成啟動的硬條件
+     * （gstatic / apple / miui 三個端點在某些網路下全不通，但代理其實可用）。
+     * bind 是本地操作、毫秒級，而且正好就是 VPN 接管路由時會失敗的那一步
+     * （實機 log: "Binding socket to network 176 failed: EPERM"），
+     * 所以它比「掃描有沒有 VPN 網路」更貼近我們真正想知道的事：能不能出去。
+     */
+    private fun canBindCellularEgress(network: android.net.Network): Boolean {
+        val probe = java.net.Socket()
+        return try {
+            network.bindSocket(probe)
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "蜂巢式出口綁定探測失敗: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        } finally {
+            try { probe.close() } catch (e: Exception) {}
+        }
+    }
+
+    private fun checkNetworkHealth(network: android.net.Network): NetworkHealthStatus {
+        val cm = connectivityManager
+        val caps = try { cm.getNetworkCapabilities(network) } catch (e: Exception) { null }
+        val hasInternet = caps != null &&
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+
+        // 先做 VPN 真正會破壞的那一步：把 socket 綁到蜂巢式出口。
+        // 舊版把「caps 異常」與「探測端點全失敗」都直接歸咎給 VPN，於是只要系統裡
+        // 有任何 VPN 網路（例如同機並存的 5G Proxy Client），5G 真的斷線也會被判成
+        // BLOCKED_BY_VPN 而永不自動重建。現在一律以 bind 探測為判據，並且要求蜂巢式
+        // 仍被系統驗證可用（VALIDATED）才敢把失敗歸給 VPN —— 詳見 NetworkHealthClassifier。
+        val bindOk = hasInternet && canBindCellularEgress(network)
+        val probeOk = bindOk && healthProbeSucceeds(network)
+
+        return NetworkHealthClassifier.classify(
+            hasInternetCapability = hasInternet,
+            cellularValidated = caps?.hasCapability(
+                android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED
+            ) == true,
+            bindSucceeded = bindOk,
+            vpnActive = VpnDetector.isVpnActive(cm),
+            probeSucceeded = probeOk
+        )
+    }
+
+    /** 依序嘗試健康檢查端點，任一成功即視為通過。 */
+    private fun healthProbeSucceeds(network: android.net.Network): Boolean {
         for (url in healthCheckUrls) {
-            if (try {
-                    network.openConnection(java.net.URL(url)).apply {
-                        connectTimeout = 3000
-                        readTimeout = 3000
-                        inputStream.use { it.read() }
-                    }
-                    true
-                } catch (e: Exception) {
-                    false
-                }) {
-                return true
+            val ok = try {
+                network.openConnection(java.net.URL(url)).apply {
+                    connectTimeout = 3000
+                    readTimeout = 3000
+                    inputStream.use { it.read() }
+                }
+                true
+            } catch (e: Exception) {
+                false
             }
+            if (ok) return true
         }
         return false
     }
@@ -613,6 +709,7 @@ class Socks5ProxyService : Service() {
         isProxyRunning = false
         proxyPaused = false
         isServiceRunning = false
+        lastErrorMessage = null
         updateStatus(ProxyStatus.STOPPED)
         serviceScope.launch {
             try {
@@ -642,7 +739,10 @@ class Socks5ProxyService : Service() {
         if (!NativeEngine.isLibraryLoaded()) return
         val stats = NativeEngine.safeGetStats()
         if (stats == "not running" || stats == "native library not loaded" || stats == "stats unavailable") return
-        val line = "${statsTimeFormat.format(java.util.Date())} $stats\n"
+        // 附上 UDP 網域解析計數：drop/qfull/jobfull/lost 非 0 就代表有 frame 沒送出去，
+        // 而這種事過去完全不留痕跡。字串為純 ASCII，不影響下方的 char/byte 等長假設。
+        val dns = NativeEngine.safeGetDnsStats()
+        val line = "${statsTimeFormat.format(java.util.Date())} $stats | dns: $dns\n"
         try {
             engineStatsFile.appendText(line)
             val content = engineStatsFile.readText()
@@ -679,6 +779,17 @@ class Socks5ProxyService : Service() {
                     java.net.DatagramSocket()
                 }
                 try {
+                    // [UDP 緩衝] 與 TCP 出口同等對待。DatagramSocket 在建構時就已 bind，
+                    // 但 Linux 的 SO_RCVBUF/SO_SNDBUF 不受 bind 限制（與 TCP connect 後
+                    // 鎖死不同）—— 已在 Debian 6.12 實測：bind 後設定仍會生效，只受
+                    // net.core.rmem_max 夾限。設定失敗不該讓整條 UDP session 建不起來，
+                    // 但也不能靜默：降級要出聲。
+                    try {
+                        ds.receiveBufferSize = SOCKET_BUFFER_BYTES
+                        ds.sendBufferSize = SOCKET_BUFFER_BYTES
+                    } catch (e: Exception) {
+                        Log.w(TAG, "UDP socket 緩衝設定失敗，沿用系統預設", e)
+                    }
                     network.bindSocket(ds)
                     val pfd = android.os.ParcelFileDescriptor.fromDatagramSocket(ds)
                     val fd = pfd.detachFd()
@@ -726,8 +837,8 @@ class Socks5ProxyService : Service() {
                     connect = { addr ->
                         val candidate = java.net.Socket()
                         try {
-                            candidate.receiveBufferSize = 3 * 1024 * 1024
-                            candidate.sendBufferSize = 3 * 1024 * 1024
+                            candidate.receiveBufferSize = SOCKET_BUFFER_BYTES
+                            candidate.sendBufferSize = SOCKET_BUFFER_BYTES
                             candidate.tcpNoDelay = true
                             network.bindSocket(candidate)
                             candidate.connect(java.net.InetSocketAddress(addr, port), connectTimeout.toInt())
@@ -799,13 +910,21 @@ class Socks5ProxyService : Service() {
         stopNativeEngineSafely()
         NativeEngine.socketProvider = null
         NativeEngine.onSocketClosed = null
+        NativeEngine.hostResolver = null
         activeSockets.values.forEach {
             if (it is Closeable) try { it.close() } catch (e: Exception) {}
         }
         activeSockets.clear()
         try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
         cellularNetwork = null
-        updateStatus(ProxyStatus.STOPPED)
+        // [失敗訊息可見性] failStop() 剛把 FAILED + lastErrorMessage 推給 UI，緊接著
+        // stopSelf() 就會走到這裡。若無條件改回 STOPPED，UI 上的失敗文字只存活一個
+        // frame（使用者實測「只閃過幾毫秒，只看到服務已停止」），錯誤原因等於被吞掉。
+        // FAILED 是終態：保留它，讓錯誤訊息留在畫面上；下一次 startProxy()/stopProxy()
+        // 會清掉 lastErrorMessage 並重新設定狀態，屆時自然復位。
+        if (currentStatus != ProxyStatus.FAILED) {
+            updateStatus(ProxyStatus.STOPPED)
+        }
         serviceScope.cancel()
         happyEyeballsScheduler.shutdownNow()
         wakeLock?.let { if (it.isHeld) it.release() }

@@ -85,6 +85,9 @@ Also set this App\'s battery saver to \"No restrictions\".</string>
     <string name="toast_notification_denied">Notifications disabled - proxy will run without a visible status notification</string>
     <string name="error_no_lan_interface">No LAN interface found (enable Wi-Fi, hotspot or USB tethering first)</string>
     <string name="error_cellular_unavailable">5G network unavailable</string>
+    <string name="error_vpn_running">VPN detected and this app may be inside its tunnel, so the cellular egress cannot be bound. Exclude this app (5G Proxy Pro) from the VPN, or turn the VPN off, and retry.</string>
+    <string name="error_cellular_bind_denied">Cannot bind the cellular egress (denied by the system) - check your 5G connection and retry</string>
+    <string name="notification_vpn_warning">⚠️ This app appears to be captured by a VPN tunnel, so the cellular proxy cannot work. Exclude 5G Proxy Pro from the VPN.</string>
     <string name="error_native_start">Native server failed: %1$s</string>
 
     <string name="btn_self_test">🧪 Self Test</string>

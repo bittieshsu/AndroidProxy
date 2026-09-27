@@ -16,6 +16,7 @@ jobject g_native_engine_instance = NULL;
 // 快取 MethodID 避免反覆查詢 (效能關鍵)
 static jmethodID g_mid_createSocket = NULL;
 static jmethodID g_mid_notifyClosed = NULL;
+static jmethodID g_mid_resolveHost = NULL;
 
 extern int socks5_server_main_dynamic(int port);
 extern void socks5_server_quit(void);
@@ -24,6 +25,9 @@ extern void socks5_server_set_bind_addrs(const char **addrs, int count);
 extern int socks5_server_is_running(void);
 extern int socks5_server_get_stats(char *out, size_t out_len);
 extern int socks5_server_get_bytes(long long *tx, long long *rx);
+// [非同步解析] UDP relay 的網域解析診斷計數（enq/ok/fail/replay/drop/qfull/...）。
+// 舊版解析失敗完全靜默，這個計數就是補上那個缺口，讓「驗證頁卡住」能在 log 裡現形。
+extern int socks5_server_get_dns_stats(char *out, size_t out_len);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -80,6 +84,42 @@ int request_java_5g_socket(const char *host, int port, int is_udp) {
     return (int)fd;
 }
 
+// 以蜂巢式網路解析主機名（Java 端 resolveWithCache：IP 字面值快路徑 + 快取 +
+// DnsResolver 逾時）。供 UDP relay 的 ATYP=0x03 網域 frame 使用——UDP worker
+// 若自己呼叫 getaddrinfo，會走系統預設網路（在 Pro 手機上可能繞回 VPN）。
+// 成功回 0 並把 IP 字面值寫進 out；失敗回 -1（out 清空）。
+int request_java_resolve_host(const char *host, char *out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    out[0] = '\0';
+    int should_detach = 0;
+    JNIEnv *env = get_jni_env(&should_detach);
+    if (!env || !g_native_engine_instance || !g_mid_resolveHost) return -1;
+
+    jstring jhost = (*env)->NewStringUTF(env, host);
+    if (!jhost) {
+        if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+        return -1;
+    }
+    jstring jres = (jstring)(*env)->CallObjectMethod(env, g_native_engine_instance, g_mid_resolveHost, jhost);
+
+    int rc = -1;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env); // 解析失敗在 Java 端是回 null，這裡只防禦意外例外
+    } else if (jres) {
+        const char *s = (*env)->GetStringUTFChars(env, jres, NULL);
+        if (s) {
+            strncpy(out, s, out_len - 1);
+            out[out_len - 1] = '\0';
+            (*env)->ReleaseStringUTFChars(env, jres, s);
+            if (out[0]) rc = 0;
+        }
+    }
+    if (jres) (*env)->DeleteLocalRef(env, jres);
+    (*env)->DeleteLocalRef(env, jhost);
+    if (should_detach) (*g_jvm)->DetachCurrentThread(g_jvm);
+    return rc;
+}
+
 void release_java_socket(int fd) {
     int should_detach = 0;
     JNIEnv *env = get_jni_env(&should_detach);
@@ -97,7 +137,7 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     // initialized 旗標），且註冊發生在任何 worker 執行緒建立之前。若萬一被重複
     // 呼叫，這裡直接返回，避免在 worker 正透過 request_java_5g_socket 使用舊
     // global ref / MethodID 時把它們刪除替換（會是 use-after-free）。
-    if (g_native_engine_instance != NULL && g_mid_createSocket != NULL && g_mid_notifyClosed != NULL) {
+    if (g_native_engine_instance != NULL && g_mid_createSocket != NULL && g_mid_notifyClosed != NULL && g_mid_resolveHost != NULL) {
         return;
     }
     if (g_native_engine_instance) (*env)->DeleteGlobalRef(env, g_native_engine_instance);
@@ -107,6 +147,10 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     jclass cls = (*env)->GetObjectClass(env, thiz);
     g_mid_createSocket = (*env)->GetMethodID(env, cls, "createSocketFromNative", "(Ljava/lang/String;IZ)I");
     g_mid_notifyClosed = (*env)->GetMethodID(env, cls, "notifySocketClosed", "(I)V");
+    g_mid_resolveHost = (*env)->GetMethodID(env, cls, "resolveHostFromNative", "(Ljava/lang/String;)Ljava/lang/String;");
+    // GetMethodID 找不到方法時會丟 NoSuchMethodError 並回 NULL；清掉例外，
+    // 讓「解析器不可用」只表現為 ATYP=0x03 frame 解析失敗，而不是整個服務崩掉。
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
 JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, jint port, jobjectArray jAddrs) {
@@ -186,6 +230,13 @@ JNIEXPORT jlongArray JNICALL native_get_traffic_bytes(JNIEnv *env, jobject thiz)
     return arr;
 }
 
+// [非同步解析診斷] UDP relay 網域解析計數（App 內「複製診斷報告」用）。
+JNIEXPORT jstring JNICALL native_get_dns_stats(JNIEnv *env, jobject thiz) {
+    char buf[256];
+    socks5_server_get_dns_stats(buf, sizeof(buf));
+    return (*env)->NewStringUTF(env, buf);
+}
+
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
@@ -194,6 +245,7 @@ static const JNINativeMethod gMethods[] = {
     {"isSocks5ServerRunning", "()Z", (void *)native_is_socks5_server_running},
     {"getSocks5Stats", "()Ljava/lang/String;", (void *)native_get_socks5_stats},
     {"getTrafficBytes", "()[J", (void *)native_get_traffic_bytes},
+    {"getDnsStats", "()Ljava/lang/String;", (void *)native_get_dns_stats},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

@@ -12,6 +12,10 @@ object NativeEngine {
     // 可能仍看到舊的 provider，或呼叫到已 teardown 的 callback。
     @Volatile var socketProvider: ((String, Int, Boolean) -> Int)? = null
     @Volatile var onSocketClosed: ((Int) -> Unit)? = null
+    // [UDP 網域 frame] UDP relay 的 ATYP=0x03 需要「以蜂巢式網路」解析主機名。
+    // 由 native UDP worker 執行緒呼叫，因此與上面兩個一樣必須 @Volatile。
+    // 回傳 IP 字面值（IPv4/IPv6），無法解析時回 null。
+    @Volatile var hostResolver: ((String) -> String?)? = null
 
     init {
         try {
@@ -41,6 +45,20 @@ object NativeEngine {
         return socketProvider?.invoke(host, port, isUdp) ?: -1
     }
 
+    /**
+     * 供 native UDP worker 呼叫（ATYP=0x03 網域 frame）。
+     * 任何例外都吞掉並回 null —— native 端只會把該 frame 丟棄，
+     * 不該讓解析問題把 UDP worker 帶走。
+     */
+    fun resolveHostFromNative(host: String): String? {
+        return try {
+            hostResolver?.invoke(host)
+        } catch (e: Exception) {
+            Log.w(TAG, "resolveHostFromNative($host) 失敗: ${e.message}")
+            null
+        }
+    }
+
     fun notifySocketClosed(fd: Int) {
         onSocketClosed?.invoke(fd)
     }
@@ -51,6 +69,11 @@ object NativeEngine {
     external fun isSocks5ServerRunning(): Boolean
     external fun getSocks5Stats(): String
     external fun getTrafficBytes(): LongArray
+    // [非同步解析診斷] UDP relay 的網域解析計數
+    // （enq/ok/fail/replay/drop/qfull/jobfull/lost）。
+    // 舊版解析失敗是完全靜默的：客戶端送出的 datagram 永遠等不到回覆，log 裡卻
+    // 一行線索都沒有 —— 這正是「驗證頁卡住卻查不出原因」的來源。這個計數補上該缺口。
+    external fun getDnsStats(): String
 
     // [自檢/診斷] 安全讀取 native 統計；程式庫未載入時回傳說明字串
     fun safeGetStats(): String {
@@ -70,5 +93,14 @@ object NativeEngine {
                 if (arr.size >= 2) arr else null
             } catch (e: Exception) { null }
         } else null
+    }
+
+    // [非同步解析診斷] 安全讀取 UDP 網域解析計數；程式庫未載入時回傳說明字串。
+    fun safeGetDnsStats(): String {
+        return if (libraryLoaded) {
+            try { getDnsStats() } catch (e: Exception) { "dns stats unavailable" }
+        } else {
+            "native library not loaded"
+        }
     }
 }

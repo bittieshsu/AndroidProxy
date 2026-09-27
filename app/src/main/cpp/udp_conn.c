@@ -1,5 +1,9 @@
 #include "udp_conn.h"
 
+int udp_event_is_dns_wake(uint64_t raw) {
+    return (raw == UDP_EV_DNS_WAKE) ? 1 : 0;
+}
+
 int udp_event_bad_slot(int sidx, int slot_count) {
     return (sidx < 0 || sidx >= slot_count) ? 1 : 0;
 }

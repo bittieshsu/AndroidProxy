@@ -25,6 +25,18 @@ typedef enum {
     UDP_ROLE_REMOTE      /* 5G 端 Remote UDP socket */
 } udp_fd_role_t;
 
+/*
+ * DNS 解析完成時喚醒 UDP worker 用的 epoll 識別碼。
+ *
+ * 真實 session 事件編碼為 (gen << 32) | slot（gen 由 1 起算且只遞增），
+ * 因此 egen == 0xFFFFFFFF 不可能出現；shutdown pipe 用的是 0（全零）。
+ * 呼叫端必須在 udp_event_decode 之前以「精確相等」比對，故結構上不可能碰撞。
+ */
+#define UDP_EV_DNS_WAKE 0xFFFFFFFFFFFFFFFFULL
+
+/* 這個 epoll 事件是否為 DNS 解析完成的喚醒訊號。 */
+int udp_event_is_dns_wake(uint64_t raw);
+
 typedef enum {
     UDP_EV_PROCESS = 0,  /* 有效事件，應進入處理 */
     UDP_EV_INACTIVE,     /* 槽位未啟用（slot_state == 0） */

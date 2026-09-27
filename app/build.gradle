@@ -115,6 +115,9 @@ tasks.register('cProtocolTest') {
             [name: 'udp_conn_test',
              srcs: ['src/main/cpp/udp_conn.c',
                     'src/test/cpp/udp_conn_test.c']],
+            [name: 'udp_dns_test',
+             srcs: ['src/main/cpp/udp_dns.c',
+                    'src/test/cpp/udp_dns_test.c']],
             [name: 'ghost_purge_test',
              srcs: ['src/test/cpp/ghost_purge_test.c']],
         ]
@@ -128,6 +131,7 @@ tasks.register('cProtocolTest') {
                        'src/main/cpp/conn_state.c',
                        'src/main/cpp/conn_forward.c',
                        'src/main/cpp/udp_conn.c',
+                       'src/main/cpp/udp_dns.c',
                        'src/main/cpp/ghost_purge.c',
                        'src/test/cpp/epoll_integration_test.c'],
                 extraFlags: ['-I', file('src/test/cpp/shim').absolutePath, '-pthread', '-D_DEFAULT_SOURCE']

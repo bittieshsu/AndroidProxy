@@ -113,9 +113,26 @@ static void test_udp_parse(void) {
     unsigned char frag_bad[12] = {0,0,1, 0x01, 1,2,3,4, 0,53, 'h','i'};
     CHECK(socks5_udp_parse(frag_bad, 12, &atyp, &addr, port) == -1);
 
-    /* ATYP=DOMAIN：UDP datagram 依 RFC 不允許，須拒絕 */
-    unsigned char dom[12] = {0,0,0, 0x03, 3,'a','b','c', 0,53, 0};
-    CHECK(socks5_udp_parse(dom, 12, &atyp, &addr, port) == -1);
+    /* ATYP=DOMAIN：RFC 1928 §7 的 UDP request header 明文允許 ATYP=0x03。
+     * [修正 2026-09-27] 舊版此處斷言「UDP datagram 依 RFC 不允許，須拒絕」，
+     * 那是誤讀 RFC：§7 的 header 就是 [RSV][FRAG][ATYP][DST.ADDR][DST.PORT][DATA]，
+     * 而 §5 定義 ATYP 可為 0x03。5G-Proxy-Client 開啟 Remote DNS 時送出的正是
+     * 網域 frame，被丟掉會讓 QUIC 等 UDP 全滅。別再改回「必須拒絕」。 */
+    unsigned char dom[13] = {0,0,0, 0x03, 3,'a','b','c', 0,53, 'h','i', 0};
+    CHECK(socks5_udp_parse(dom, 13, &atyp, &addr, port) == 10); /* 4+1+3+2 */
+    CHECK(atyp == 0x03);
+    CHECK(addr[0] == 3);                      /* *addr 指向長度欄 */
+    CHECK(addr[1] == 'a' && addr[3] == 'c');  /* 網域位元組緊接在後 */
+    CHECK(port[0] == 0 && port[1] == 53);
+
+    /* 網域表頭不完整：缺網域尾／缺 port */
+    CHECK(socks5_udp_parse(dom, 7, &atyp, &addr, port) == -1);
+    CHECK(socks5_udp_parse(dom, 8, &atyp, &addr, port) == -1);
+    /* 空網域（長度欄 = 0）與「只有長度欄、沒有網域位元組」 */
+    unsigned char dom_empty[10] = {0,0,0, 0x03, 0, 0,53, 0,0, 0};
+    CHECK(socks5_udp_parse(dom_empty, 10, &atyp, &addr, port) == -1);
+    unsigned char dom_trunc[5] = {0,0,0, 0x03, 3};
+    CHECK(socks5_udp_parse(dom_trunc, 5, &atyp, &addr, port) == -1);
 
     /* ATYP 不支援（0x00 / 0xFF） */
     unsigned char bad_atyp[12] = {0,0,0, 0x00, 1,2,3,4, 0,53, 'h','i'};

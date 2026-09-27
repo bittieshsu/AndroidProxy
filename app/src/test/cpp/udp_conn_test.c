@@ -74,11 +74,44 @@ static void test_idle_expired(void) {
     CHECK(udp_conn_idle_expired(100, 39, 60) == 1); /* 61s idle > 60s */
 }
 
+/* [非同步解析] 喚醒識別碼必須與 shutdown 識別碼（0）及所有真實 session 事件互斥。
+ * worker 的事件迴圈順序是：先比對 0（shutdown）、再比對喚醒值、最後才解碼；
+ * 一旦碰撞，worker 會把某條 session 的事件當成喚醒，或反之 —— 兩者都很難查。 */
+static void test_dns_wake(void) {
+    CHECK(udp_event_is_dns_wake(UDP_EV_DNS_WAKE) == 1);
+
+    /* shutdown pipe 用的全零識別碼不可以被當成喚醒 */
+    CHECK(udp_event_is_dns_wake(0) == 0);
+
+    /* 真實 session 事件：gen 由 1 起算且只遞增，slot 落在 [0, 1088)。
+     * 掃過邊界組合，確認都不等於喚醒值。 */
+    uint32_t gens[] = {1u, 2u, 0x7FFFFFFFu, 0xFFFFFFFEu};
+    uint32_t slots[] = {0u, 1u, 1087u, 0xFFFFFFFFu};
+    for (size_t gi = 0; gi < sizeof gens / sizeof gens[0]; gi++) {
+        for (size_t si = 0; si < sizeof slots / sizeof slots[0]; si++) {
+            uint64_t raw = ((uint64_t)gens[gi] << 32) | slots[si];
+            CHECK(udp_event_is_dns_wake(raw) == 0);
+            /* 帶角色旗標的變體同樣不得碰撞 */
+            CHECK(udp_event_is_dns_wake(raw | UDP_EV_ROLE_LOCAL_FLAG) == 0);
+            CHECK(udp_event_is_dns_wake(raw | UDP_EV_ROLE_REMOTE_FLAG) == 0);
+        }
+    }
+
+    /* 縱深防禦：即使有人漏了喚醒比對，這個識別碼解出來的 slot 也必然越界，
+     * 會被 udp_event_bad_slot 攔下（而不是誤打某一條真 session）。 */
+    uint32_t sidx, egen;
+    udp_fd_role_t role;
+    udp_event_decode(UDP_EV_DNS_WAKE, &sidx, &egen, &role);
+    CHECK(udp_event_bad_slot((int)sidx, 1088) == 1);
+    CHECK(egen == 0xFFFFFFFFu);
+}
+
 int main(void) {
     test_bad_slot();
     test_decode();
     test_check_slot();
     test_idle_expired();
+    test_dns_wake();
     if (g_failures == 0) {
         printf("udp_conn_test: ALL PASS\n");
         return 0;

@@ -613,6 +613,10 @@ class DebugActivity : Activity() {
     }
 
     private fun startProxyFlow() {
+        // 註：這裡刻意不做「有 VPN 就先擋」的前置檢查。VPN 存在 ≠ 它接管了本 App 的
+        // 路由（per-app VPN 未包含本 App 時代理照常可用），用存在與否當前提會誤殺
+        // 可用的設定。能不能出去由服務端實際 bind 一次蜂巢式出口來決定，
+        // 失敗時會以 FAILED 狀態把原因顯示在畫面上（見 onDestroy 保留 FAILED）。
         if (!PowerPermissionHelper.isWhitelisted(this)) {
             // 未加入電池白名單：說明風險，並允許使用者「仍然繼續」
             PowerPermissionHelper.showOptimizationDialog(this) {
@@ -872,6 +876,9 @@ class DebugActivity : Activity() {
         sb.append(cellularIPText.text).append("\n")
 
         sb.append("NativeStats: ").append(NativeEngine.safeGetStats()).append("\n")
+        // [非同步解析] UDP 網域解析計數。drop/qfull/jobfull/lost 只要非 0，
+        // 就代表有 frame 沒被送出（上層只能重傳）—— 這是「驗證頁卡住」的量化證據。
+        sb.append("DnsStats: ").append(NativeEngine.safeGetDnsStats()).append("\n")
 
         // 附上滾動落檔的歷史痕跡（release 版可直接看，不需 root / debug 版）
         try {
