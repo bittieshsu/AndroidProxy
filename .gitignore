@@ -47,3 +47,4 @@ tools/update_fdroiddata.py
 
 # Local agent memory — machine-specific, never publish
 AGENTS.md
+.workbuddy-ai/
