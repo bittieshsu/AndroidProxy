@@ -28,6 +28,10 @@ extern int socks5_server_get_bytes(long long *tx, long long *rx);
 // [非同步解析] UDP relay 的網域解析診斷計數（enq/ok/fail/replay/drop/qfull/...）。
 // 舊版解析失敗完全靜默，這個計數就是補上那個缺口，讓「驗證頁卡住」能在 log 裡現形。
 extern int socks5_server_get_dns_stats(char *out, size_t out_len);
+// [拆除診斷] UDP session 拆除的分類計數（永遠開啟）與逐行 log 的開發者開關。
+// 計數讓使用者不必開 log 也能看見 churn；開關只影響逐行明細。
+extern int socks5_server_get_udp_close_stats(char *out, size_t out_len);
+extern int socks5_server_set_udp_verbose_log(int on);
 
 static pthread_t g_server_thread;
 static int g_server_running = 0;
@@ -153,10 +157,10 @@ JNIEXPORT void JNICALL native_register_instance(JNIEnv *env, jobject thiz) {
     if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
 }
 
-JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, jint port, jobjectArray jAddrs) {
-    if (g_server_running) return (*env)->NewStringUTF(env, "Already running");
-
-    // 從 Java 複製綁定位址到 C 層靜態緩衝區（socks5_server_set_bind_addrs 會自行複製內容）
+// 把 Java 的 String[] 綁定位址送進 C 層（socks5_server_set_bind_addrs 會自行複製
+// 內容，因此這裡的暫存陣列可以安全地在函式結束後失效）。
+// 上限 32 筆；C 層另有 MAX_BIND_ADDRS 上限，超出者由那裡截斷。
+static void apply_bind_addrs_from_java(JNIEnv *env, jobjectArray jAddrs) {
     const char *tmp[32];
     jstring jsArr[32];
     int count = 0;
@@ -181,12 +185,26 @@ JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, 
         (*env)->ReleaseStringUTFChars(env, jsArr[i], tmp[i]);
         (*env)->DeleteLocalRef(env, jsArr[i]);
     }
+}
+
+JNIEXPORT jstring JNICALL native_start_socks5_server(JNIEnv *env, jobject thiz, jint port, jobjectArray jAddrs) {
+    if (g_server_running) return (*env)->NewStringUTF(env, "Already running");
+
+    apply_bind_addrs_from_java(env, jAddrs);
 
     ServerArgs *args = malloc(sizeof(ServerArgs));
     args->port = (int)port;
     g_server_running = 1;
     pthread_create(&g_server_thread, NULL, server_thread_func, args);
     return (*env)->NewStringUTF(env, "Started");
+}
+
+// [listener 重建] 執行期更新監聽位址集合：Wi-Fi／熱點／USB 分享的介面位址變動時，
+// Java 端呼叫這裡把新的集合交給引擎。實際的 listener 由 listener 執行緒在下一輪
+// poll（≤1 秒）對齊 —— 新位址綁上、消失的位址下線，**不重建代理、不斷既有連線**。
+JNIEXPORT jstring JNICALL native_update_socks5_bind_addrs(JNIEnv *env, jobject thiz, jobjectArray jAddrs) {
+    apply_bind_addrs_from_java(env, jAddrs);
+    return (*env)->NewStringUTF(env, "OK");
 }
 
 JNIEXPORT jstring JNICALL native_stop_socks5_server(JNIEnv *env, jobject thiz) {
@@ -237,15 +255,30 @@ JNIEXPORT jstring JNICALL native_get_dns_stats(JNIEnv *env, jobject thiz) {
     return (*env)->NewStringUTF(env, buf);
 }
 
+// [拆除診斷] UDP session 拆除的分類計數（落檔 + 複製診斷報告用）。
+JNIEXPORT jstring JNICALL native_get_udp_close_stats(JNIEnv *env, jobject thiz) {
+    char buf[256];
+    socks5_server_get_udp_close_stats(buf, sizeof(buf));
+    return (*env)->NewStringUTF(env, buf);
+}
+
+// [開發者開關] 逐行拆除 log。執行期可切換，不必重啟 server。
+JNIEXPORT void JNICALL native_set_udp_verbose_log(JNIEnv *env, jobject thiz, jboolean on) {
+    socks5_server_set_udp_verbose_log(on == JNI_TRUE ? 1 : 0);
+}
+
 static const JNINativeMethod gMethods[] = {
     {"nativeRegisterInstance", "()V", (void *)native_register_instance},
     {"startSocks5Server", "(I[Ljava/lang/String;)Ljava/lang/String;", (void *)native_start_socks5_server},
+    {"updateSocks5BindAddrs", "([Ljava/lang/String;)Ljava/lang/String;", (void *)native_update_socks5_bind_addrs},
     {"stopSocks5Server", "()Ljava/lang/String;", (void *)native_stop_socks5_server},
     {"setSocks5Auth", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", (void *)native_set_socks5_auth},
     {"isSocks5ServerRunning", "()Z", (void *)native_is_socks5_server_running},
     {"getSocks5Stats", "()Ljava/lang/String;", (void *)native_get_socks5_stats},
     {"getTrafficBytes", "()[J", (void *)native_get_traffic_bytes},
     {"getDnsStats", "()Ljava/lang/String;", (void *)native_get_dns_stats},
+    {"getUdpCloseStats", "()Ljava/lang/String;", (void *)native_get_udp_close_stats},
+    {"setUdpVerboseLog", "(Z)V", (void *)native_set_udp_verbose_log},
 };
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {

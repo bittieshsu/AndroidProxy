@@ -27,6 +27,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <poll.h>
+#include <dirent.h>
 #include <stdatomic.h>
 
 // ---------- 公開 API（定義於 simple-socks5.c） ----------
@@ -396,6 +397,123 @@ static int udp_frame_payload(const unsigned char *body, int dlen, const unsigned
     return dlen - hl;
 }
 
+// ================= [listener 重建] 測試素材 =================
+//
+// 目的：鎖住「介面消失後 listener 必須自行重建」這個回歸。
+//
+// 實機實測（小米 Pad Mini / Android 15，2026-09-27）：Wi-Fi 關閉時核心會直接把綁在
+// wlan0 位址上的 listener 關掉（/proc/net/tcp 只剩 loopback），Wi-Fi 開回來後即使
+// IPv4 完全沒變也依然只剩 loopback —— 舊版 listener 只在啟動時綁一次、之後永不重建，
+// 於是代理顯示「運行中」卻永遠連不上，只能手動重啟服務。
+//
+// host 上可完全重現的兩個探針：
+//   A. 執行期更新 desired 集合 → 新位址必須在數秒內被綁上、被移除的位址必須下線，
+//      且既有連線必須存活（不得為了換 listener 而重建代理）。
+//   B. 直接把引擎的 listener fd 關掉（模擬核心所為）→ 引擎必須自行重建它。
+//      少了 B，A 有可能靠「啟動時綁一次」假通過；兩者一起才鎖得住這個機制。
+
+// 連到 ip:port；成功回 fd（含 I/O 逾時），失敗回 -1。
+static int connect_to(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) { close(fd); return -1; }
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
+    set_io_timeout(fd, 5);
+    return fd;
+}
+
+// 重試版：等待 listener 被建立（引擎對帳節奏約 1 秒，這裡留足餘裕）。
+static int connect_to_retry(const char *ip, int port, int attempts, int interval_ms) {
+    for (int i = 0; i < attempts; i++) {
+        int fd = connect_to(ip, port);
+        if (fd >= 0) return fd;
+        usleep((useconds_t)interval_ms * 1000);
+    }
+    return -1;
+}
+
+// 在已連上代理的 fd 上完成握手 + CONNECT(target_ip:target_port)，成功回 0。
+static int proxy_open_tunnel(int c, const char *target_ip, int target_port) {
+    unsigned char buf[16];
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00;
+    if (send(c, buf, 3, 0) != 3) return -1;
+    if (recv(c, buf, 2, MSG_WAITALL) != 2) return -1;
+    if (buf[0] != 0x05 || buf[1] != 0x00) return -1;
+
+    struct in_addr a;
+    if (inet_pton(AF_INET, target_ip, &a) != 1) return -1;
+    buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 0x01;
+    memcpy(buf + 4, &a, 4);
+    buf[8] = (unsigned char)(target_port >> 8);
+    buf[9] = (unsigned char)(target_port & 0xFF);
+    if (send(c, buf, 10, 0) != 10) return -1;
+    if (recv(c, buf, 10, MSG_WAITALL) != 10) return -1;
+    if (buf[0] != 0x05 || buf[1] != 0x00) return -1;
+    return 0;
+}
+
+// 在既有隧道上送 payload 並驗證 echo 完整回傳；成功回 0。
+static int echo_on_fd(int c, const char *payload, int payload_len) {
+    if (send(c, payload, payload_len, 0) != payload_len) return -1;
+    unsigned char buf[256];
+    int got = 0;
+    while (got < payload_len) {
+        int n = recv(c, buf, sizeof(buf), 0);
+        if (n <= 0) return -1;
+        if (got + n > payload_len) return -1;
+        if (memcmp(buf, payload + got, n) != 0) return -1;
+        got += n;
+    }
+    return 0;
+}
+
+// 找出引擎綁在 ip:port 上的 listener fd（以 SO_ACCEPTCONN + getsockname 認身分）。
+// 找不到回 -1。用於模擬「核心在介面消失時把 listener 關掉」。
+static int find_listener_fd(const char *ip, int port) {
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    int found = -1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        int fd = atoi(e->d_name);
+        int acceptconn = 0;
+        socklen_t ol = sizeof(acceptconn);
+        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &acceptconn, &ol) != 0) continue;
+        if (!acceptconn) continue;
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        if (getsockname(fd, (struct sockaddr *)&sa, &sl) != 0) continue;
+        if (sa.sin_family != AF_INET) continue;
+        if (ntohs(sa.sin_port) != (uint16_t)port) continue;
+        char buf[INET_ADDRSTRLEN] = {0};
+        if (!inet_ntop(AF_INET, &sa.sin_addr, buf, sizeof(buf))) continue;
+        if (strcmp(buf, ip) == 0) { found = fd; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+// 讀 /proc/self/fd/<fd> 的連結取得 socket inode；不是 socket 或讀不到回 0。
+//
+// 為什麼非用它不可：fd 編號會被重用 —— 關掉一個 listener 後，引擎重建的新 listener
+// 極可能拿到同一個編號（實測兩次都是 29）。所以「fd 編號不同」不能當作重建的證據，
+// 「inode 不同」才能。同理，bare connect() 也不能當判據：關閉當下引擎可能正卡在
+// poll() 內，那個 syscall 對 fd 的引用會讓舊 socket 多活到 poll 返回，期間連線仍會
+// 被排進它的 backlog（連得上但沒人服務）。因此重建後必須走完整 SOCKS5 握手。
+static unsigned long long fd_socket_inode(int fd) {
+    char path[64];
+    char buf[128] = {0};
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    if (readlink(path, buf, sizeof(buf) - 1) <= 0) return 0;
+    if (strncmp(buf, "socket:[", 8) != 0) return 0;
+    return strtoull(buf + 8, NULL, 10);
+}
+
 int main(void) {
     int failed = 0;
 
@@ -620,6 +738,110 @@ int main(void) {
             failed = 1;
         }
         if (failed == 0) printf("PASS: no ghost events / no slot leak\n");
+    }
+
+    // 6b. [listener 重建] 執行期更新綁定位址 + 模擬核心關掉 listener 後自行重建。
+    //     放在槽位/洩漏斷言之後，避免本段額外的連線影響上面那組不變式。
+    {
+        // (a) 既有連線：先經 loopback 建一條隧道並確認可用（等一下要用它驗證
+        //     「換 listener 不得切斷既有連線」）。
+        int keep = connect_to("127.0.0.1", PROXY_PORT);
+        int have_keep = (keep >= 0 && proxy_open_tunnel(keep, "127.0.0.1", ECHO_PORT) == 0
+                         && echo_on_fd(keep, "before-rebind", 13) == 0);
+        if (!have_keep) {
+            fprintf(stderr, "FAIL: rebind 前無法建立既有連線\n");
+            failed = 1;
+        } else {
+            printf("PASS: rebind 前既有連線可用\n");
+        }
+
+        // (b) 執行期把 127.0.0.2 加入 desired 集合（127.0.0.0/8 在 Linux 上免設定即可綁）
+        const char *addrs_new[] = { "127.0.0.2" };
+        socks5_server_set_bind_addrs(addrs_new, 1);
+        int c_new = connect_to_retry("127.0.0.2", PROXY_PORT, 40, 100);
+        if (c_new < 0) {
+            fprintf(stderr, "FAIL: 執行期新增的綁定位址沒有被綁上（127.0.0.2:%d）\n", PROXY_PORT);
+            failed = 1;
+        } else {
+            printf("PASS: 執行期新增綁定位址已生效\n");
+            close(c_new);
+        }
+
+        // (c) 既有連線必須存活 —— 換 listener 不可以是「重建代理」
+        if (have_keep && echo_on_fd(keep, "after-rebind", 12) != 0) {
+            fprintf(stderr, "FAIL: 更新綁定位址切斷了既有連線\n");
+            failed = 1;
+        } else if (have_keep) {
+            printf("PASS: 更新綁定位址後既有連線存活\n");
+        }
+
+        // (d) 模擬核心在介面消失時關掉 listener → 引擎必須自行重建
+        {
+            int lfd = find_listener_fd("127.0.0.2", PROXY_PORT);
+            if (lfd < 0) {
+                fprintf(stderr, "FAIL: 找不到 127.0.0.2:%d 的 listener fd\n", PROXY_PORT);
+                failed = 1;
+            } else {
+                unsigned long long ino_before = fd_socket_inode(lfd);
+                close(lfd); // 模擬核心所為：fd 失效但引擎不知情
+                // 等對帳週期跑幾輪（poll 逾時 1 秒）。此時 127.0.0.2 仍在 desired
+                // 集合內，所以引擎唯一的出路就是「發現失效 → 重建」。
+                usleep(3000 * 1000);
+                int newfd = find_listener_fd("127.0.0.2", PROXY_PORT);
+                unsigned long long ino_after = (newfd >= 0) ? fd_socket_inode(newfd) : 0;
+                if (newfd < 0 || ino_after == 0 || ino_after == ino_before) {
+                    fprintf(stderr, "FAIL: listener 被關掉後引擎沒有重建"
+                                    "（inode %llu → %llu，代理會顯示運行中卻不通）\n",
+                            ino_before, ino_after);
+                    failed = 1;
+                } else {
+                    // 真正的可用性判據：完整 SOCKS5 握手 + CONNECT + 資料回流。
+                    // bare connect() 不算數 —— 舊 socket 在 poll() 持有引用的期間
+                    // 仍會把連線收進 backlog，連得上卻沒有人服務。
+                    int c_heal = connect_to("127.0.0.2", PROXY_PORT);
+                    int ok = (c_heal >= 0
+                              && proxy_open_tunnel(c_heal, "127.0.0.1", ECHO_PORT) == 0
+                              && echo_on_fd(c_heal, "healed", 6) == 0);
+                    if (c_heal >= 0) close(c_heal);
+                    if (!ok) {
+                        fprintf(stderr, "FAIL: 重建後的 listener 無法服務連線\n");
+                        failed = 1;
+                    } else {
+                        printf("PASS: listener 被關掉後引擎自行重建並可服務（inode %llu → %llu）\n",
+                               ino_before, ino_after);
+                    }
+                }
+            }
+        }
+
+        // (e) 從 desired 集合移除的位址必須下線（不再佔用槽位，也避免無限累積）
+        const char *addrs_back[] = { "127.0.0.1" };
+        socks5_server_set_bind_addrs(addrs_back, 1);
+        usleep(2500 * 1000);
+        int c_old = connect_to("127.0.0.2", PROXY_PORT);
+        if (c_old >= 0) {
+            fprintf(stderr, "FAIL: 已從 desired 移除的位址仍在監聽\n");
+            failed = 1;
+            close(c_old);
+        } else {
+            printf("PASS: 移除的綁定位址已下線\n");
+        }
+
+        // (f) 綁不上的位址不得把整個服務帶走（優雅降級）：192.0.2.0/24 是 TEST-NET-1，
+        //     本機不存在，bind 必然失敗；loopback 必須照常服務。
+        const char *addrs_bad[] = { "192.0.2.7" };
+        socks5_server_set_bind_addrs(addrs_bad, 1);
+        usleep(2500 * 1000);
+        const char *alive = "still-alive";
+        if (do_roundtrip(alive, (int)strlen(alive)) != 0) {
+            fprintf(stderr, "FAIL: 無法綁定的位址把 loopback 服務也帶走了\n");
+            failed = 1;
+        } else {
+            printf("PASS: 無法綁定的位址不影響既有服務\n");
+        }
+        socks5_server_set_bind_addrs(addrs_back, 1); // 還原
+
+        if (have_keep) close(keep);
     }
 
     // 7. 停止

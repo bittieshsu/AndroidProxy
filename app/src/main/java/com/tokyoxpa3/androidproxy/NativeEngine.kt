@@ -59,11 +59,27 @@ object NativeEngine {
         }
     }
 
+    // [listener 重建] 安全更新綁定位址集合。失敗只記一筆 warning —— 位址集合更新
+    // 失敗不該把代理帶走：引擎仍會用既有的集合繼續服務，下次介面事件會再試。
+    fun safeUpdateBindAddrs(bindAddrs: Array<String>) {
+        if (!libraryLoaded) return
+        try {
+            updateSocks5BindAddrs(bindAddrs)
+        } catch (e: Exception) {
+            Log.w(TAG, "updateSocks5BindAddrs 失敗: ${e.message}")
+        }
+    }
+
     fun notifySocketClosed(fd: Int) {
         onSocketClosed?.invoke(fd)
     }
     
     external fun startSocks5Server(port: Int, bindAddrs: Array<String>): String
+    // [listener 重建] 執行期更新監聽位址集合（Wi-Fi／熱點／USB 分享位址變動時）。
+    // 只更新「想要的集合」，實際 listener 由引擎在 ≤1 秒內對齊：新位址綁上、
+    // 消失的位址下線，**不重建代理、不斷既有連線**。這是「介面被關掉時核心會把
+    // listener 一起關掉，而舊版永不重建」的修復入口。
+    external fun updateSocks5BindAddrs(bindAddrs: Array<String>): String
     external fun stopSocks5Server(): String
     external fun setSocks5Auth(user: String, pass: String): String
     external fun isSocks5ServerRunning(): Boolean
@@ -74,6 +90,14 @@ object NativeEngine {
     // 舊版解析失敗是完全靜默的：客戶端送出的 datagram 永遠等不到回覆，log 裡卻
     // 一行線索都沒有 —— 這正是「驗證頁卡住卻查不出原因」的來源。這個計數補上該缺口。
     external fun getDnsStats(): String
+
+    // [拆除診斷] UDP session 拆除的分類計數（total/short/idle/peer/io/proto/
+    // resource/shutdown/unknown/verbose）。永遠開啟，成本是每個 session 一次
+    // atomic 加 —— 所以「不開 log 也看得見 churn」。
+    external fun getUdpCloseStats(): String
+    // [開發者開關] 逐行拆除 log。預設關：一般使用者不需要，開了只會把 logcat 沖掉。
+    // 執行期可切換（不必重啟 server）。漏插樁警告不受此開關管制，永遠出聲。
+    external fun setUdpVerboseLog(on: Boolean)
 
     // [自檢/診斷] 安全讀取 native 統計；程式庫未載入時回傳說明字串
     fun safeGetStats(): String {
@@ -101,6 +125,24 @@ object NativeEngine {
             try { getDnsStats() } catch (e: Exception) { "dns stats unavailable" }
         } else {
             "native library not loaded"
+        }
+    }
+
+    // [拆除診斷] 安全讀取 UDP 拆除分類計數；程式庫未載入時回傳說明字串。
+    fun safeGetUdpCloseStats(): String {
+        return if (libraryLoaded) {
+            try { getUdpCloseStats() } catch (e: Exception) { "udp close stats unavailable" }
+        } else {
+            "native library not loaded"
+        }
+    }
+
+    // [開發者開關] 安全套用逐行拆除 log 開關。失敗只記一筆 warning —— 這是診斷
+    // 功能，不該因為它而影響代理運作。
+    fun safeSetUdpVerboseLog(on: Boolean) {
+        if (!libraryLoaded) return
+        try { setUdpVerboseLog(on) } catch (e: Exception) {
+            Log.w(TAG, "setUdpVerboseLog($on) 失敗: ${e.message}")
         }
     }
 }

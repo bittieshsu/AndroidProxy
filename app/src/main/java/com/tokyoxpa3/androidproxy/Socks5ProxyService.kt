@@ -49,6 +49,11 @@ class Socks5ProxyService : Service() {
     }
     @Volatile
     private var cellularNetwork: android.net.Network? = null
+    // [LAN 監聽重建] 最後一次送給 native 引擎的 LAN 綁定位址集合。用來判斷介面位址
+    // 是否真的變了 —— 位址沒變時不重送，避免無謂地動 listener（同一位址的介面
+    // 「關掉再開」由 native 每秒對帳自行修復，不需要 Java 插手）。
+    @Volatile
+    private var lanBindAddrs: Set<String>? = null
 
     private val activeSockets = java.util.concurrent.ConcurrentHashMap<Int, Any>()
 
@@ -212,6 +217,11 @@ class Socks5ProxyService : Service() {
         // 一次數十個 datagram）很容易在 kernel 佇列就被丟掉，接著就是重傳與卡頓。
         // 3 MB 與 TCP 出口一致，且遠低於 8 MB 上限（kernel 會把值加倍後套用）。
         private const val SOCKET_BUFFER_BYTES = 3 * 1024 * 1024
+
+        // [開發者開關] 逐行 UDP session 拆除 log 的偏好設定鍵（存於 "proxy_config"）。
+        // 預設 false：一般使用者不需要逐行明細，開了只會把 logcat 沖掉。拆除的
+        // 「分類計數」不受此開關影響，永遠落檔 —— 所以預設也不會回到完全靜默。
+        const val PREF_UDP_VERBOSE_LOG = "udp_verbose_log"
         @Volatile var isServiceRunning = false
 
         @Volatile var currentStatus = ProxyStatus.STOPPED
@@ -385,6 +395,9 @@ class Socks5ProxyService : Service() {
                 val authUser = prefs.getString("auth_user", "") ?: ""
                 val authPass = prefs.getString("auth_pass", "") ?: ""
                 NativeEngine.setSocks5Auth(authUser, authPass)
+                // [開發者開關] 每次啟動都重新套用一次：native 端的旗標是 process 全域，
+                // 但服務可能被系統回收後重建，不能假設它還留著。
+                NativeEngine.safeSetUdpVerboseLog(prefs.getBoolean(PREF_UDP_VERBOSE_LOG, false))
                 
                 // 只綁定 LAN 介面（Wi-Fi/熱點/USB 分享），絕不綁到行動網路
                 val bindAddrs = collectLanBindAddresses()
@@ -393,6 +406,7 @@ class Socks5ProxyService : Service() {
                     return@launch
                 }
                 Log.i(TAG, "SOCKS5 listener bind addresses: ${bindAddrs.joinToString()}")
+                lanBindAddrs = bindAddrs.toSet()
                 val startResult = NativeEngine.startSocks5Server(port, bindAddrs)
                 if (startResult != "Started") {
                     failStop(getString(R.string.error_native_start, startResult))
@@ -471,6 +485,28 @@ class Socks5ProxyService : Service() {
                         }
                     }
 
+                    // [LAN 監聽重建] Wi-Fi／熱點／USB 分享的介面位址可能在服務運行中變動。
+                    //
+                    // 舊版 listener 只在啟動時綁一次、之後永不重建，而實測（小米 Pad Mini /
+                    // Android 15）：Wi-Fi 關閉時核心會直接把綁在 wlan0 位址上的 listener
+                    // 關掉（/proc/net/tcp 只剩 loopback），Wi-Fi 開回來後即使 IPv4 完全沒變
+                    // 也依然是空的 —— 代理顯示「運行中」卻連不上，只能手動重啟服務。
+                    // 行動網路關/開之所以沒事，是因為那條路徑本來就有 onLost/onAvailable
+                    // 處理，LAN 介面則從來沒有人管。
+                    //
+                    // native 端現在每秒把實際監聽集合對齊 desired 集合，所以「同一位址的
+                    // 介面回來」會自行修復；這裡只負責在「位址本身變了」時把新集合送進去。
+                    // 刻意用輪詢而非 ConnectivityManager 的 NetworkCallback：熱點分享與
+                    // USB 分享介面不是 ConnectivityManager 意義下的 Network，拿不到回呼，
+                    // 輪詢才能一體涵蓋三種分享方式。
+                    launch {
+                        while (isProxyRunning && !stopRequested) {
+                            delay(5000)
+                            if (stopRequested || !isProxyRunning) break
+                            refreshLanBindAddrs("watchdog")
+                        }
+                    }
+
                     // [偵測落檔] 每 5 分鐘把生命週期計數器 snapshot 落檔（release 版也有）
                     launch {
                         while (isProxyRunning && !stopRequested) {
@@ -504,6 +540,7 @@ class Socks5ProxyService : Service() {
         stopNativeEngineSafely()
         try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
         cellularNetwork = null
+        lanBindAddrs = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -533,7 +570,27 @@ class Socks5ProxyService : Service() {
         }
         return result.toTypedArray()
     }
-    
+
+    /**
+     * [LAN 監聽重建] 重新收集 LAN 綁定位址；只有「集合真的變了」才送給 native 引擎。
+     *
+     * 位址集合為空時刻意不動：介面剛斷、或 Wi-Fi 剛連上但 DHCP 還沒配好位址時都可能
+     * 收不到任何位址，此時清空 desired 集合只會把還活著的 listener 一起拆掉。保留舊
+     * 集合即可 —— 位址不存在時 native 的每秒對帳綁不上，位址一回來就自動綁上。
+     *
+     * 全程不重建代理：listener 由 native 端就地增減，既有連線不受影響。
+     */
+    private fun refreshLanBindAddrs(reason: String) {
+        if (!isProxyRunning || engineStarting || isRestarting) return
+        val addrs = collectLanBindAddresses()
+        if (addrs.isEmpty()) return
+        val current = addrs.toSet()
+        if (current == lanBindAddrs) return
+        Log.w(TAG, "LAN 綁定位址變更（$reason）：${lanBindAddrs ?: emptySet()} → $current，就地更新監聽")
+        lanBindAddrs = current
+        NativeEngine.safeUpdateBindAddrs(addrs)
+    }
+
     /**
      * 電信端行動網路變更（換 5G IP、PDN 重建、暫時失效…）。
      *
@@ -589,6 +646,7 @@ class Socks5ProxyService : Service() {
                 activeSockets.clear()
                 dnsCache.clear()
                 cellularNetwork = null
+                lanBindAddrs = null
                 
                 val nm = getSystemService(NotificationManager::class.java)
                 nm.notify(NOTIFICATION_ID, createNotification(getString(R.string.notification_restarting), getString(R.string.notification_restarting)))
@@ -717,6 +775,7 @@ class Socks5ProxyService : Service() {
                 stopNativeEngineSafely()
                 networkManager.releaseCellularNetwork()
                 cellularNetwork = null
+                lanBindAddrs = null
                 
                 activeSockets.values.forEach { 
                     if (it is Closeable) try { it.close() } catch(e: Exception){} 
@@ -742,7 +801,11 @@ class Socks5ProxyService : Service() {
         // 附上 UDP 網域解析計數：drop/qfull/jobfull/lost 非 0 就代表有 frame 沒送出去，
         // 而這種事過去完全不留痕跡。字串為純 ASCII，不影響下方的 char/byte 等長假設。
         val dns = NativeEngine.safeGetDnsStats()
-        val line = "${statsTimeFormat.format(java.util.Date())} $stats | dns: $dns\n"
+        // [拆除診斷] 再附上 UDP session 拆除的分類計數。short（存活不到 1 秒就拆）
+        // 持續增加就代表客戶端在反覆重建會話 —— 這正是逐行 log 想抓的東西，
+        // 但這裡不必開 log、不必接 adb 就有，且計數是永遠開啟的。
+        val udpClose = NativeEngine.safeGetUdpCloseStats()
+        val line = "${statsTimeFormat.format(java.util.Date())} $stats | dns: $dns | udp_close: $udpClose\n"
         try {
             engineStatsFile.appendText(line)
             val content = engineStatsFile.readText()
@@ -917,6 +980,7 @@ class Socks5ProxyService : Service() {
         activeSockets.clear()
         try { networkManager.releaseCellularNetwork() } catch (e: Exception) {}
         cellularNetwork = null
+        lanBindAddrs = null
         // [失敗訊息可見性] failStop() 剛把 FAILED + lastErrorMessage 推給 UI，緊接著
         // stopSelf() 就會走到這裡。若無條件改回 STOPPED，UI 上的失敗文字只存活一個
         // frame（使用者實測「只閃過幾毫秒，只看到服務已停止」），錯誤原因等於被吞掉。

@@ -41,6 +41,7 @@ class DebugActivity : Activity() {
     private lateinit var mainButton: Button
     private lateinit var selfTestButton: Button
     private lateinit var copyDiagnosticsButton: Button
+    private lateinit var udpVerboseSwitch: Switch
     private lateinit var selfTestResultText: TextView
     private lateinit var trafficUploadValue: TextView
     private lateinit var trafficDownloadValue: TextView
@@ -523,6 +524,34 @@ class DebugActivity : Activity() {
             ).apply {
                 topMargin = 24
             }
+
+            // [開發者開關] 逐行 UDP session 拆除 log。預設關：一般使用者不需要，
+            // 開了只會把 logcat 沖掉。拆除的「分類計數」不受此開關影響 ——
+            // 它永遠寫進 engine_stats.log，所以預設也不會回到完全靜默。
+            val udpVerboseRow = LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, 8)
+            }
+            udpVerboseRow.addView(TextView(context).apply {
+                text = getString(R.string.switch_udp_verbose_log)
+                textSize = 14f
+                setTextColor(0xFF495057.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            udpVerboseSwitch = Switch(context).apply {
+                // 先設 isChecked 再掛 listener，避免初始化時就觸發一次寫入。
+                isChecked = getSharedPreferences("proxy_config", Context.MODE_PRIVATE)
+                    .getBoolean(Socks5ProxyService.PREF_UDP_VERBOSE_LOG, false)
+                setOnCheckedChangeListener { _, checked ->
+                    getSharedPreferences("proxy_config", Context.MODE_PRIVATE).edit()
+                        .putBoolean(Socks5ProxyService.PREF_UDP_VERBOSE_LOG, checked).apply()
+                    // 立即套用：native 旗標執行期可切換，不必重啟服務。
+                    NativeEngine.safeSetUdpVerboseLog(checked)
+                }
+            }
+            udpVerboseRow.addView(udpVerboseSwitch)
+            addView(udpVerboseRow)
 
             selfTestButton = Button(context).apply {
                 text = getString(R.string.btn_self_test)

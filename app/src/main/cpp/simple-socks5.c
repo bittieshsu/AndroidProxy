@@ -189,12 +189,26 @@ static atomic_int server_running = 0;
 static pthread_t listener_thread;
 static atomic_int next_worker_idx = 0;
 
-#define MAX_LISTENERS 8
 #define MAX_BIND_ADDRS 16
+// [listener 對帳] 槽位必須容得下「整個 desired 集合」再加 loopback 兩個：
+// reconcile 的語意是「讓實際監聽集合等於 desired ∪ loopback」，槽位不足時超出的
+// 位址會靜默地永遠綁不上。舊版固定 8 槽（2 loopback + 少量 LAN 位址）看不出來，
+// 但一旦加入執行期重建就必須讓上限與 MAX_BIND_ADDRS 對齊。
+#define MAX_LISTENERS (MAX_BIND_ADDRS + 2)
 static int g_listener_fds[MAX_LISTENERS];
+// 每個槽位記住它綁的是哪個位址字串。reconcile 靠它判斷「還想不想要」，
+// 也靠它做 fd 身分驗證 —— fd 可能已被核心關閉、號碼被本行程的其他 socket 重用。
+static char g_listener_addrs[MAX_LISTENERS][INET6_ADDRSTRLEN];
 static int g_listener_count = 0;
+// g_listener_* 由 listener 執行緒獨占寫入；socks5_server_quit（JNI 執行緒）也會關
+// listener，因此整張表以鎖保護。accept() 不在鎖內（維持既有行為）。
+static pthread_mutex_t g_listener_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static char g_bind_addrs[MAX_BIND_ADDRS][INET6_ADDRSTRLEN];
 static int g_bind_count = 0;
+// desired 集合由 Java 執行緒寫入（socks5_server_set_bind_addrs，執行期可呼叫）、
+// listener 執行緒每秒讀取，因此以鎖保護。
+static pthread_mutex_t g_bind_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -896,6 +910,22 @@ static void send_zero_reply(int client_fd, unsigned char rep) {
 #define UDP_WORKER_COUNT 4
 #define UDP_SLOT_COUNT 1088
 
+// [拆除診斷] 拆除原因分類。用途是「不必開逐行 log 也能看見 churn 的形狀」：
+// 分類計數永遠開啟（成本 = 每個 session 一次 atomic 加），逐行 LOGE 才受
+// g_udp_verbose_log 控制。這樣預設不會把使用者淹在 logcat 裡，但也不會回到
+// 「拆除完全靜默」那個舊洞 —— 沉默的預設等於把當初要抓的 bug 重新藏起來。
+typedef enum {
+    UDP_CLOSE_NONE = 0,   // 未插樁（走到 finalize 卻沒設分類）→ 計數在 unknown
+    UDP_CLOSE_IDLE,       // 閒置逾時
+    UDP_CLOSE_PEER,       // 對端關閉（EOF / ERR / HUP / RDHUP）
+    UDP_CLOSE_IO,         // 本端收送失敗（send/recv/recvfrom 錯誤）
+    UDP_CLOSE_PROTO,      // 協定違規（frame 長度欄）
+    UDP_CLOSE_RESOURCE,   // 資源耗盡（緩衝 / socket / epoll 註冊 / 額度 / 槽位）
+    UDP_CLOSE_SHUTDOWN,   // 收攤（worker 退出 / 建立時已在停止中）
+    UDP_CLOSE_UNKNOWN,    // 分類值越界（防禦用）
+    UDP_CLOSE_KIND_COUNT
+} udp_close_kind_t;
+
 typedef struct udp_conn_t {
     uint32_t magic;
     int slot;
@@ -928,6 +958,9 @@ typedef struct udp_conn_t {
     uint32_t remote_events; // 5G remote UDP fd 的興趣遮罩（0x04 背壓時遮罩 EPOLLIN）
 
     int closed;
+    // [診斷] 拆除原因分類（見 udp_close_kind_t）。刻意放在 closed 之後 —— 這裡本來
+    // 就是 4 B 對齊洞，所以這個欄位不增加 struct 大小（以 NDK clang 佈局 dump 驗證）。
+    int close_kind;
     // [診斷] 拆除原因。由觸發拆除的那條路徑設定（一律指向字串常值，不涉所有權），
     // 統一在 udp_conn_finalize 印一次。補這個洞的理由：先前**所有**拆除路徑都不留
     // 任何痕跡，UDP-in-TCP 的會話反覆重建在伺服器端完全隱形，只能靠推測。
@@ -977,6 +1010,17 @@ static atomic_int g_udp_next_worker = 0;
 static atomic_llong g_udp_st_acquired = 0, g_udp_st_released = 0;
 static atomic_llong g_udp_st_stale = 0, g_udp_st_bad_slot = 0;
 static atomic_llong g_udp_st_exhausted = 0, g_udp_st_double_fin = 0;
+
+// [拆除診斷] 按原因分類的拆除計數。永遠開啟 —— 成本是每個 session 收攤時一次
+// atomic 加，與一行 log 的 6–8 µs 相比可忽略，但換來「不開 log 也看得見 churn」。
+static atomic_llong g_udp_close_kind[UDP_CLOSE_KIND_COUNT];
+// 存活不到 1 秒就拆掉的 session 數。這個數字才是 churn 的判據：
+// 正常收攤會活到閒置逾時（UDP_IDLE_TIMEOUT_SEC），短命的一直增加就是客戶端在重建。
+static atomic_llong g_udp_close_short_lived = 0;
+static atomic_llong g_udp_close_total = 0;
+// [開發者開關] 逐行拆除 log（含存活/閒置秒數與 errno）。預設關：
+// 一般使用者不需要它，開了只會把 logcat 沖掉；開發者排查 churn 時再打開。
+static atomic_int g_udp_verbose_log = 0;
 // [流量統計] UDP per-worker tx/rx 位元組累加器（與 TCP 分開宣告，讀取時一併加總）。
 static atomic_llong g_udp_tx_bytes[UDP_WORKER_COUNT];
 static atomic_llong g_udp_rx_bytes[UDP_WORKER_COUNT];
@@ -1348,15 +1392,30 @@ static void udp_conn_finalize(udp_conn_t *u) {
         long idle = (long)(now - u->last_active);
         if (lived < 0) lived = 0;
         if (idle < 0) idle = 0;
-        if (u->close_reason) {
+
+        // [拆除診斷] 分類計數永遠開啟 —— 每個 session 一次 atomic 加，與一行 log 的
+        // 6–8 µs 相比可忽略。這樣逐行 log 關著時 churn 的形狀仍然看得見：
+        // 沉默的預設等於把「拆除完全不留痕跡」那個舊洞補回去。
+        int kind = u->close_kind;
+        if (kind <= UDP_CLOSE_NONE || kind >= UDP_CLOSE_KIND_COUNT) kind = UDP_CLOSE_UNKNOWN;
+        atomic_fetch_add(&g_udp_close_kind[kind], 1);
+        atomic_fetch_add(&g_udp_close_total, 1);
+        if (lived < 1) atomic_fetch_add(&g_udp_close_short_lived, 1);
+
+        if (!u->close_reason) {
+            // 漏插樁是程式缺陷，不是日常噪音，所以刻意不受開發者開關管制 ——
+            // 正確的組建裡這個數字永遠是 0，一旦出現就必須看得見。
+            // （舊版只在 closed==1 時才出聲，於是「finalize 了但既沒原因也沒 closed」
+            // 的路徑仍完全靜默，與「漏插樁不會再隱形」的宣稱不符。）
+            LOGE("udp session 拆除但無原因（漏插樁？）: mode=%s slot=%d client_fd=%d 存活=%lds",
+                 mode, u->slot, u->client_fd, lived);
+        } else if (atomic_load(&g_udp_verbose_log)) {
+            // 逐行明細只在開發者開關打開時才印：每行 6–8 µs（實測），且會佔用 logcat。
+            // 判讀：存活只有幾百毫秒且同一個 client_fd 反覆出現 = churn。
             LOGE("udp session 拆除: %s | mode=%s slot=%d client_fd=%d errno=%d(%s) 存活=%lds 閒置=%lds pend=%d",
                  u->close_reason, mode, u->slot, u->client_fd, u->close_errno,
                  u->close_errno ? strerror(u->close_errno) : "n/a",
                  lived, idle, udp_dns_pend_count(u->pend, UDP_DNS_PEND_SLOTS));
-        } else if (u->closed) {
-            // 漏插樁會在這裡現形，不會再靜默
-            LOGE("udp session 拆除但無原因（漏插樁？）: mode=%s slot=%d client_fd=%d 存活=%lds",
-                 mode, u->slot, u->client_fd, lived);
         }
     }
     udp_worker_t *w = &udp_workers[u->widx];
@@ -1398,6 +1457,7 @@ static int udp_flush_out(udp_conn_t *u) {
         if (n > 0) { u->out_off += n; }
         else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         else {
+            u->close_kind = UDP_CLOSE_IO;
             u->close_reason = "0x04 出向 frame send() 到 client 失敗";
             u->close_errno = errno;
             return -1;
@@ -1410,6 +1470,7 @@ static int udp_flush_out(udp_conn_t *u) {
 // 0x03：client 控制連線事件 → 偵測對端是否斷開。回傳 -1 = 關閉。
 static int udp_ctrl_event(udp_conn_t *u, uint32_t ev) {
     if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        u->close_kind = UDP_CLOSE_PEER;
         u->close_reason = "0x03 控制連線收到 ERR/HUP/RDHUP";
         u->close_errno = 0;
         return -1;
@@ -1420,11 +1481,13 @@ static int udp_ctrl_event(udp_conn_t *u, uint32_t ev) {
         char tmp[256];
         ssize_t n = recv(u->client_fd, tmp, sizeof(tmp), 0);
         if (n == 0) {
+            u->close_kind = UDP_CLOSE_PEER;
             u->close_reason = "0x03 控制連線被客戶端關閉 (EOF)";
             u->close_errno = 0;
             return -1;
         }
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            u->close_kind = UDP_CLOSE_IO;
             u->close_reason = "0x03 控制連線 recv 失敗";
             u->close_errno = errno;
             return -1;
@@ -1441,6 +1504,7 @@ static int udp_local_event(udp_conn_t *u) {
         ssize_t r = recvfrom(u->local_udp_fd, u->in_buf, BUFFER_SIZE, 0, (struct sockaddr*)&tmp, &tlen);
         if (r < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            u->close_kind = UDP_CLOSE_IO;
             u->close_reason = "0x03 local UDP recvfrom 失敗";
             u->close_errno = errno;
             return -1;
@@ -1471,6 +1535,7 @@ static int udp_remote_event(udp_conn_t *u) {
             ssize_t r = recvfrom(u->remote_udp_fd, u->in_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
             if (r < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                u->close_kind = UDP_CLOSE_IO;
                 u->close_reason = "0x03 5G remote recvfrom 失敗";
                 u->close_errno = errno;
                 return -1;
@@ -1498,6 +1563,7 @@ static int udp_remote_event(udp_conn_t *u) {
             ssize_t r = recvfrom(u->remote_udp_fd, u->out_buf + off, BUFFER_SIZE - off, 0, (struct sockaddr*)&src6, &sl);
             if (r < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+                u->close_kind = UDP_CLOSE_IO;
                 u->close_reason = "0x04 5G remote recvfrom 失敗";
                 u->close_errno = errno;
                 return -1;
@@ -1538,12 +1604,14 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
                 ssize_t n = recv(u->client_fd, u->len_bytes + u->len_got, 2 - u->len_got, 0);
                 if (n > 0) { u->len_got += n; }
                 else if (n == 0) {
+                    u->close_kind = UDP_CLOSE_PEER;
                     u->close_reason = "0x04 客戶端關閉（讀長度欄時 EOF）";
                     u->close_errno = 0;
                     return -1;
                 }
                 else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
                 else {
+                    u->close_kind = UDP_CLOSE_IO;
                     u->close_reason = "0x04 讀長度欄 recv 失敗";
                     u->close_errno = errno;
                     return -1;
@@ -1551,6 +1619,7 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
             }
             int dlen = socks5_udp_tcp_frame_len(u->len_bytes, BUFFER_SIZE);
             if (dlen < 0) { // 協定違規：裝不下表頭或爆緩衝
+                u->close_kind = UDP_CLOSE_PROTO;
                 u->close_reason = "0x04 frame 長度欄違規（超出 BUFFER_SIZE）";
                 u->close_errno = 0;
                 return -1;
@@ -1562,12 +1631,14 @@ static int udp_client_data_event(udp_conn_t *u, uint32_t ev) {
             ssize_t n = recv(u->client_fd, u->in_buf + u->frame_got, u->frame_expect - u->frame_got, 0);
             if (n > 0) { u->frame_got += n; }
             else if (n == 0) {
+                u->close_kind = UDP_CLOSE_PEER;
                 u->close_reason = "0x04 客戶端關閉（讀 frame body 時 EOF）";
                 u->close_errno = 0;
                 return -1;
             }
             else if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             else {
+                u->close_kind = UDP_CLOSE_IO;
                 u->close_reason = "0x04 讀 frame body recv 失敗";
                 u->close_errno = errno;
                 return -1;
@@ -1704,6 +1775,7 @@ static void* udp_worker_loop(void* arg) {
                     // [非同步解析] 有待補送的 frame 時同樣不可回收
                     udp_dns_pend_count(cur->pend, UDP_DNS_PEND_SLOTS) == 0 &&
                     udp_conn_idle_expired(now, cur->last_active, UDP_IDLE_TIMEOUT_SEC)) {
+                    cur->close_kind = UDP_CLOSE_IDLE;
                     cur->close_reason = "閒置逾時（超過 UDP_IDLE_TIMEOUT_SEC 無活動）";
                     cur->close_errno = 0;
                     cur->closed = 1;
@@ -1741,6 +1813,7 @@ exit_udp_worker:
             if (cur->next) cur->next->prev = cur->prev;
             cur->next = NULL; cur->prev = NULL;
             if (cur->magic == UDP_CONN_MAGIC) {
+                cur->close_kind = UDP_CLOSE_SHUTDOWN;
                 cur->close_reason = "worker 退出（伺服器停止）";
                 cur->close_errno = 0;
                 cur->closed = 1;
@@ -1792,6 +1865,7 @@ static void udp_start_session(int client_fd, int cmd) {
     atomic_store(&u->refs, 1);
     atomic_store(&u->finalized, 0);
     atomic_store(&u->registered, 0);
+    u->close_kind = UDP_CLOSE_NONE;
     u->close_reason = NULL;
     u->close_errno = 0;
     u->last_active = time(NULL);
@@ -1799,6 +1873,7 @@ static void udp_start_session(int client_fd, int cmd) {
     u->in_buf = malloc(BUFFER_SIZE + 64);
     u->out_buf = malloc(BUFFER_SIZE + 64);
     if (!u->in_buf || !u->out_buf) {
+        u->close_kind = UDP_CLOSE_RESOURCE;
         u->close_reason = "session 建立失敗：緩衝配置失敗";
         u->close_errno = 0;
         udp_conn_unref(u);
@@ -1813,6 +1888,7 @@ static void udp_start_session(int client_fd, int cmd) {
         if (local_udp_fd < 0) {
             // [修正] 以前這裡直接收攤、不回應 → 客戶端 recv 只拿到 EOF 或等到逾時，
             // 分不清「伺服器拒絕」與「網路斷線」。先回覆再收攤。
+            u->close_kind = UDP_CLOSE_RESOURCE;
             u->close_reason = "0x03 session 建立失敗：local relay socket 建不起來";
             u->close_errno = errno;
             send_zero_reply(client_fd, 0x01);
@@ -1839,6 +1915,7 @@ static void udp_start_session(int client_fd, int cmd) {
         // 移到回覆之前，失敗才能誠實回 REP=0x04（host unreachable）。
         int remote_udp_fd = request_java_5g_socket("", 0, 1); // is_udp = 1
         if (remote_udp_fd < 0) {
+            u->close_kind = UDP_CLOSE_RESOURCE;
             u->close_reason = "0x03 session 建立失敗：5G 出口 UDP socket 建不起來";
             u->close_errno = errno;
             send_zero_reply(client_fd, 0x04);
@@ -1883,6 +1960,7 @@ static void udp_start_session(int client_fd, int cmd) {
     } else { // 0x04 UDP-in-TCP
         int remote_udp_fd = request_java_5g_socket("", 0, 1);
         if (remote_udp_fd < 0) {
+            u->close_kind = UDP_CLOSE_RESOURCE;
             u->close_reason = "0x04 session 建立失敗：5G 出口 UDP socket 建不起來";
             u->close_errno = errno;
             send_zero_reply(client_fd, 0x04);
@@ -1904,6 +1982,7 @@ static void udp_start_session(int client_fd, int cmd) {
     // epoll 做 EPOLL_CTL_ADD（或註冊後無人 unref 而洩漏 session）。
     pthread_mutex_lock(&w->list_lock);
     if (atomic_load(&w->stopping)) {
+        u->close_kind = UDP_CLOSE_SHUTDOWN;
         u->close_reason = "session 建立時 worker 正在停止（未註冊）";
         u->close_errno = 0;
         pthread_mutex_unlock(&w->list_lock);
@@ -1931,6 +2010,7 @@ static void udp_start_session(int client_fd, int cmd) {
         reg_ok = (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, u->remote_udp_fd, &ev) == 0);
     }
     if (!reg_ok) {
+        u->close_kind = UDP_CLOSE_RESOURCE;
         u->close_reason = "session 建立失敗：epoll 註冊失敗";
         u->close_errno = errno;
         u->closed = 1;
@@ -2217,29 +2297,148 @@ typedef struct {
     int port;
 } ListenerArgs;
 
-// 為指定位址建立 TCP listener（AF_INET / AF_INET6），成功則加入 g_listener_fds
-static void add_listener(int family, const void *addr, socklen_t addrlen, int port) {
-    if (g_listener_count >= MAX_LISTENERS) return;
-    int fd = socket(family, SOCK_STREAM, 0);
-    if (fd < 0) return;
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    set_nonblocking(fd);
-    if (family == AF_INET6) {
+// ---------- listener 對帳（reconcile） ----------
+//
+// [為什麼需要這一整組] 舊版只在啟動時綁一次 listener，之後永不重建。實測（小米 Pad
+// Mini / Android 15，2026-09-27）：Wi-Fi 關閉時核心會直接把綁在 wlan0 位址上的
+// listener 關掉 —— /proc/net/tcp 只剩 loopback 兩個，而 Wi-Fi 開回來後 IPv4 位址
+// 完全相同（192.168.1.178）也依然只剩 loopback，代理顯示「運行中」卻連不上，
+// 只能靠使用者手動重啟服務。行動網路關/開之所以沒事，是因為那條路徑本來就有
+// onLost/onAvailable 處理，而 LAN 介面從來沒有人管。
+//
+// 現在的語意：listener 執行緒每秒把「實際監聽集合」對齊「desired ∪ loopback」，
+// 因此介面消失時會發現 fd 已失效並移除槽位、介面回來時同一輪就重新綁上，
+// 全程不必重建代理、既有連線不受影響。
+
+// 這個 fd 是否仍是「我們自己綁在那個位址上的 listener」。
+// 關閉前必須驗明身分：核心關掉 listener 後那個 fd 號碼可能已被本行程的新 socket
+// 重用，盲目 close() 會關掉無辜的連線。
+static int listener_is_ours(int fd, const char *ip, int port) {
+    if (fd < 0) return 0;
+    int acceptconn = 0;
+    socklen_t optlen = sizeof(acceptconn);
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &acceptconn, &optlen) != 0) return 0;
+    if (!acceptconn) return 0;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getsockname(fd, (struct sockaddr *)&ss, &slen) != 0) return 0;
+    char buf[INET6_ADDRSTRLEN] = {0};
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *sa = (struct sockaddr_in *)&ss;
+        if (ntohs(sa->sin_port) != (uint16_t)port) return 0;
+        if (!inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) return 0;
+    } else if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sa = (struct sockaddr_in6 *)&ss;
+        if (ntohs(sa->sin6_port) != (uint16_t)port) return 0;
+        if (!inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) return 0;
+    } else {
+        return 0;
+    }
+    return strcmp(buf, ip) == 0;
+}
+
+// loopback 監聽不隨 LAN 介面變動：本機自檢與健康檢查靠它，必須永遠在。
+static int is_permanent_addr(const char *ip) {
+    return strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0;
+}
+
+static int addr_in_list(const char *ip, char list[][INET6_ADDRSTRLEN], int count) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(ip, list[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+// 為指定位址建立 TCP listener 並佔用一個槽位（呼叫者需持有 g_listener_lock）。
+// 回傳 1 = 已建立、0 = 失敗。失敗是常態而非異常：介面還沒回來時 bind 會
+// EADDRNOTAVAIL，下一輪 reconcile 自然重試。
+static int add_listener_for_ip(const char *ip, int port) {
+    if (g_listener_count >= MAX_LISTENERS) return 0;
+    struct in_addr a4;
+    struct in6_addr a6;
+    int fd = -1;
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        set_nonblocking(fd);
+        struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr = a4, .sin_port = htons(port) };
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return 0; }
+    } else if (inet_pton(AF_INET6, ip, &a6) == 1) {
+        fd = socket(AF_INET6, SOCK_STREAM, 0);
+        if (fd < 0) return 0;
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         int v6only = 1;
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
-        struct sockaddr_in6 sa;
-        memcpy(&sa, addr, sizeof(sa));
-        sa.sin6_port = htons(port);
-        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return; }
+        set_nonblocking(fd);
+        struct sockaddr_in6 sa = { .sin6_family = AF_INET6, .sin6_addr = a6, .sin6_port = htons(port) };
+        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return 0; }
     } else {
-        struct sockaddr_in sa;
-        memcpy(&sa, addr, sizeof(sa));
-        sa.sin_port = htons(port);
-        if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(fd); return; }
+        return 0;
     }
-    if (listen(fd, 128) < 0) { close(fd); return; }
-    g_listener_fds[g_listener_count++] = fd;
+    if (listen(fd, 128) < 0) { close(fd); return 0; }
+    g_listener_fds[g_listener_count] = fd;
+    strncpy(g_listener_addrs[g_listener_count], ip, INET6_ADDRSTRLEN - 1);
+    g_listener_addrs[g_listener_count][INET6_ADDRSTRLEN - 1] = '\0';
+    g_listener_count++;
+    LOGI("listener 已綁定 %s:%d (槽位 %d/%d)", ip, port, g_listener_count, MAX_LISTENERS);
+    return 1;
+}
+
+// 移除槽位 i（呼叫者需持有 g_listener_lock）。只有驗明「仍是我們自己的 listener」
+// 才真的 close()，否則只把槽位從表上摘掉 —— 見 listener_is_ours 的說明。
+static void drop_listener_slot(int i, int port) {
+    if (i < 0 || i >= g_listener_count) return;
+    int fd = g_listener_fds[i];
+    if (listener_is_ours(fd, g_listener_addrs[i], port)) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+    for (int k = i; k + 1 < g_listener_count; k++) {
+        g_listener_fds[k] = g_listener_fds[k + 1];
+        memcpy(g_listener_addrs[k], g_listener_addrs[k + 1], INET6_ADDRSTRLEN);
+    }
+    g_listener_count--;
+    g_listener_fds[g_listener_count] = -1;
+    g_listener_addrs[g_listener_count][0] = '\0';
+}
+
+// 讓實際監聽集合等於「desired ∪ loopback」。只在 listener 執行緒呼叫（每輪 poll
+// 一次，約 1 秒），因此槽位的增減與 accept() 天然互斥、不需要額外的 fd 生命週期
+// 防護。quit 會先設 server_running=0，故鎖內再檢查一次以免關機期間又綁回來。
+static void reconcile_listeners(int port) {
+    char desired[MAX_BIND_ADDRS][INET6_ADDRSTRLEN];
+    int desired_count;
+
+    pthread_mutex_lock(&g_bind_lock);
+    memcpy(desired, g_bind_addrs, sizeof(desired));
+    desired_count = g_bind_count;
+    pthread_mutex_unlock(&g_bind_lock);
+
+    pthread_mutex_lock(&g_listener_lock);
+    if (!atomic_load(&server_running)) {
+        pthread_mutex_unlock(&g_listener_lock);
+        return;
+    }
+    for (int i = 0; i < g_listener_count; ) {
+        const char *ip = g_listener_addrs[i];
+        int wanted = is_permanent_addr(ip) || addr_in_list(ip, desired, desired_count);
+        if (wanted && listener_is_ours(g_listener_fds[i], ip, port)) { i++; continue; }
+        // 仍想要卻不再是我們的 listener → 介面消失時被核心關掉了，重建即可。
+        // 不再想要 → 位址已從 desired 移除，正常下線。
+        LOGE("listener %s:%d %s，移除槽位", ip, port,
+             wanted ? "已失效（介面消失）" : "不再需要");
+        drop_listener_slot(i, port);
+    }
+    if (!addr_in_list("127.0.0.1", g_listener_addrs, g_listener_count)) add_listener_for_ip("127.0.0.1", port);
+    if (!addr_in_list("::1", g_listener_addrs, g_listener_count)) add_listener_for_ip("::1", port);
+    for (int i = 0; i < desired_count; i++) {
+        if (addr_in_list(desired[i], g_listener_addrs, g_listener_count)) continue;
+        add_listener_for_ip(desired[i], port);
+    }
+    pthread_mutex_unlock(&g_listener_lock);
 }
 
 static void* listener_task(void* arg) {
@@ -2259,26 +2458,13 @@ static void* listener_task(void* arg) {
     // 永遠卡在 pthread_cond_wait（job_pool_shutdown 從未被呼叫），而
     // socks5_server_quit 又因 server_running==0 提早返回、join 不到 —— 每次啟動
     // 失敗就洩漏 192 條執行緒。先綁定即可讓失敗路徑只涉及一個 pipe。
+    pthread_mutex_lock(&g_listener_lock);
     g_listener_count = 0;
+    pthread_mutex_unlock(&g_listener_lock);
 
-    // 本機 loopback（供健康檢查與本機使用，不對外暴露）
-    struct sockaddr_in lo4 = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
-    add_listener(AF_INET, &lo4, sizeof(lo4), port);
-    struct sockaddr_in6 lo6 = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT };
-    add_listener(AF_INET6, &lo6, sizeof(lo6), port);
-
-    // 只綁定 LAN 介面位址（Wi-Fi / 熱點 / USB 分享），絕不綁到行動網路
-    for (int i = 0; i < g_bind_count && g_listener_count < MAX_LISTENERS; i++) {
-        struct in_addr a4;
-        struct in6_addr a6;
-        if (inet_pton(AF_INET, g_bind_addrs[i], &a4) == 1) {
-            struct sockaddr_in sa = { .sin_family = AF_INET, .sin_addr = a4 };
-            add_listener(AF_INET, &sa, sizeof(sa), port);
-        } else if (inet_pton(AF_INET6, g_bind_addrs[i], &a6) == 1) {
-            struct sockaddr_in6 sa = { .sin6_family = AF_INET6, .sin6_addr = a6 };
-            add_listener(AF_INET6, &sa, sizeof(sa), port);
-        }
-    }
+    // 本機 loopback + 只綁 LAN 介面位址（Wi-Fi / 熱點 / USB 分享），
+    // 絕不綁到行動網路。實際綁定由 reconcile 統一處理，之後每輪 poll 都會再對帳。
+    reconcile_listeners(port);
 
     if (g_listener_count == 0) {
         LOGE("沒有可綁定的 LAN 位址，SOCKS5 伺服器無法啟動");
@@ -2337,17 +2523,26 @@ static void* listener_task(void* arg) {
 
     struct pollfd pfds[MAX_LISTENERS + 1];
     while (atomic_load(&server_running)) {
+        // [listener 對帳] 每輪（含 poll 逾時後，約 1 秒）把實際監聽集合對齊 desired。
+        // 介面消失時核心關掉的 listener 會在此被發現並移除，介面回來時同一輪重建 ——
+        // 這是「Wi-Fi 關掉再開、代理顯示運行中卻不通」的修復點。
+        reconcile_listeners(port);
+
         pfds[0].fd = g_shutdown_pipe[0]; pfds[0].events = POLLIN; pfds[0].revents = 0;
         int n = 1;
+        pthread_mutex_lock(&g_listener_lock);
         for (int i = 0; i < g_listener_count; i++) {
             pfds[n].fd = g_listener_fds[i]; pfds[n].events = POLLIN; pfds[n].revents = 0;
             n++;
         }
+        pthread_mutex_unlock(&g_listener_lock);
         int res = poll(pfds, n, 1000);
         if (res <= 0) continue;
         if (pfds[0].revents) break; // shutdown pipe
 
         for (int i = 1; i < n; i++) {
+            // POLLNVAL：fd 已失效（核心在介面消失時關掉了它）。不在此關閉 ——
+            // 號碼可能已被重用，交給下一輪 reconcile 以 desired 集合重建。
             if (!(pfds[i].revents & (POLLIN | POLLERR | POLLHUP))) continue;
             for (;;) {
                 int cfd = accept(pfds[i].fd, NULL, NULL);
@@ -2364,21 +2559,31 @@ static void* listener_task(void* arg) {
         }
     }
 
+    pthread_mutex_lock(&g_listener_lock);
     for (int i = 0; i < g_listener_count; i++) {
         if (g_listener_fds[i] >= 0) { close(g_listener_fds[i]); g_listener_fds[i] = -1; }
     }
     g_listener_count = 0;
+    pthread_mutex_unlock(&g_listener_lock);
     return NULL;
 }
 
+// [listener 重建] 更新「想要的綁定位址集合」。執行期可呼叫（Java 端在 Wi-Fi／熱點／
+// USB 分享位址變動時呼叫），實際的 listener 由 listener 執行緒在下一輪 poll（≤1 秒）
+// 對齊：新位址綁上、消失的位址下線，既有連線不受影響、代理不重建。
 void socks5_server_set_bind_addrs(const char **addrs, int count) {
-    g_bind_count = 0;
-    for (int i = 0; i < count && g_bind_count < MAX_BIND_ADDRS; i++) {
+    char next[MAX_BIND_ADDRS][INET6_ADDRSTRLEN];
+    int next_count = 0;
+    for (int i = 0; i < count && next_count < MAX_BIND_ADDRS; i++) {
         if (!addrs || !addrs[i] || !addrs[i][0]) continue;
-        strncpy(g_bind_addrs[g_bind_count], addrs[i], INET6_ADDRSTRLEN - 1);
-        g_bind_addrs[g_bind_count][INET6_ADDRSTRLEN - 1] = '\0';
-        g_bind_count++;
+        strncpy(next[next_count], addrs[i], INET6_ADDRSTRLEN - 1);
+        next[next_count][INET6_ADDRSTRLEN - 1] = '\0';
+        next_count++;
     }
+    pthread_mutex_lock(&g_bind_lock);
+    memcpy(g_bind_addrs, next, sizeof(next));
+    g_bind_count = next_count;
+    pthread_mutex_unlock(&g_bind_lock);
 }
 
 // [item6] 供 JNI 健康檢查直接讀取運行旗標，取代每 10 秒開真實 TCP 連線
@@ -2414,6 +2619,34 @@ int socks5_server_get_dns_stats(char *out, size_t out_len) {
              atomic_load(&g_dns_st_fail), atomic_load(&g_dns_st_replay),
              atomic_load(&g_dns_st_drop), atomic_load(&g_dns_st_qfull),
              atomic_load(&g_dns_st_jobfull), atomic_load(&g_dns_st_lost));
+    return 0;
+}
+
+// [拆除診斷] 讀取按原因分類的 UDP session 拆除計數。永遠開啟，供 engine_stats.log
+// 落檔與「複製診斷報告」使用 —— 使用者不必開逐行 log 也能看到 churn 的形狀。
+// short = 存活不到 1 秒就拆掉的數量：正常收攤會活到閒置逾時，這個數字持續增加
+// 就代表客戶端在反覆重建會話。unknown = 走到 finalize 卻沒插樁（正常應為 0）。
+int socks5_server_get_udp_close_stats(char *out, size_t out_len) {
+    if (!out || out_len == 0) return -1;
+    snprintf(out, out_len,
+             "total=%lld short=%lld idle=%lld peer=%lld io=%lld proto=%lld resource=%lld shutdown=%lld unknown=%lld verbose=%d",
+             (long long)atomic_load(&g_udp_close_total),
+             (long long)atomic_load(&g_udp_close_short_lived),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_IDLE]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_PEER]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_IO]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_PROTO]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_RESOURCE]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_SHUTDOWN]),
+             (long long)atomic_load(&g_udp_close_kind[UDP_CLOSE_UNKNOWN]),
+             atomic_load(&g_udp_verbose_log));
+    return 0;
+}
+
+// [開發者開關] 逐行拆除 log 的執行期開關（不必重啟 server）。
+// 預設關：一般使用者不需要它，開了只會把 logcat 沖掉。
+int socks5_server_set_udp_verbose_log(int on) {
+    atomic_store(&g_udp_verbose_log, on ? 1 : 0);
     return 0;
 }
 
@@ -2472,11 +2705,15 @@ void socks5_server_quit(void) {
     if (!atomic_load(&server_running)) return;
     atomic_store(&server_running, 0);
 
-    // 關閉所有 listener，立即釋放綁定的埠號
+    // 關閉所有 listener，立即釋放綁定的埠號。與 listener 執行緒的 reconcile 共用
+    // 同一把鎖：server_running 已在上方歸零，reconcile 於鎖內會再檢查一次而放棄，
+    // 因此不會出現「關機途中又被綁回來」。
+    pthread_mutex_lock(&g_listener_lock);
     for (int i = 0; i < g_listener_count; i++) {
         if (g_listener_fds[i] >= 0) { shutdown(g_listener_fds[i], SHUT_RDWR); close(g_listener_fds[i]); g_listener_fds[i] = -1; }
     }
     g_listener_count = 0;
+    pthread_mutex_unlock(&g_listener_lock);
 
     if (g_shutdown_pipe[1] != -1) {
         char stop_sig = 1;
