@@ -1,215 +1,215 @@
 # 5G Proxy Pro (AndroidProxy)
 
+**English** · [繁體中文](README.zh-TW.md) · [한국어](README.ko.md)
+
 [<img src="assets/f-droid-badge.png" alt="Get it on F-Droid" height="80">](https://f-droid.org/packages/com.tokyoxpa3.androidproxy/)
 [<img src="assets/github-badge.png" alt="Get it on GitHub" height="80">](https://github.com/tokyoxpa3/5G-Proxy-Pro/releases/latest)
 
-一個將手機 **5G / 蜂巢式網路流量強制鎖定並透過 SOCKS5 伺服器分享**的 Android App。
+An Android app that **locks your device to the 5G / cellular connection and shares it as a SOCKS5 proxy**.
 
-使用 Android 的 `ConnectivityManager.requestNetwork()` 鎖定蜂巢式網路（TRANSPORT_CELLULAR），配合原生 C 實作的 SOCKS5 伺服器（epoll 多路複用），將經由 **5G 網路的 TCP/UDP 流量**透過代理分享給其他裝置（同 Wi-Fi 下的手機、電腦等）。
-
-> This app locks your device to the cellular (5G/4G) connection and exposes a SOCKS5 proxy over Wi-Fi, so other devices can route their traffic through the phone's cellular network. The proxy engine is a native C (epoll-based) implementation stripped via JNI.
+It uses Android's `ConnectivityManager.requestNetwork()` to pin the cellular network (TRANSPORT_CELLULAR), and a native C SOCKS5 server (epoll multiplexing) to share **TCP/UDP traffic egressing over 5G** with other devices — phones on the same Wi-Fi, computers, and so on.
 
 ---
 
-## 功能特色
+## Features
 
-- 🔒 **強制鎖定蜂巢式網路** — 透過 `NetworkRequest` 將 Socket 綁定到 5G 網路（`Network.bindSocket`），不受 Wi-Fi 干擾
-- 🔑 **可選帳密認證**（RFC 1929）— 預設無認證（開放代理）；**帳號與密碼兩者都填寫**才會啟用認證，任一欄位留空即不啟用（避免空值放行任意輸入）
-- 🧦 **完整 SOCKS5 代理** — 原生 C 引擎（epoll，可併發），支援 TCP（CONNECT）與 UDP（ASSOCIATE），IPv4 / IPv6 / 網域 (DOMAIN) 地址皆支援
-- 🛰️ **只綁定 LAN 介面** — 監聽器僅綁定 Wi-Fi / 熱點分享 / USB 分享等區域網路位址（另有本機 loopback 供健康檢查），**絕不暴露在行動網路介面上**
-- 🧵 **UDP-in-TCP** — 自訂擴充指令 `0x04`：UDP relay 資料以 frame 走同一條 TCP 連線，不受 UDP 壅塞/優先權影響（見下方協定規格）
-- 🔁 **IPv6 優先 Happy Eyeballs** — TCP 連線以 RFC 8305 錯開競速：IPv6 先行、IPv4 延後 250ms 接手，先成功者勝出（先前為 IPv4 偏好的並行競速）
-- ❤️ **20 秒循環心跳** — 防止 5G 掉線或進入省電模式
-- 🛡️ **原生引擎健康檢查** — 每 10 秒驗證 SOCKS5 伺服器存活，異常自動重啟；內建停止旗標，不會與「使用者按下停止」競態造成殭屍監聽
-- 📢 **真實狀態回報** — Service 透過 callback 回報實際狀態（啟動中/運行中/暫停/重建中/已停止/失敗），UI 不靠猜測
-- 🔔 **通知權限** — Android 13+ 啟動前會請求 `POST_NOTIFICATIONS`，前景服務通知正常顯示
-- 🧪 **內建 SOCKS5 自我檢測 + 一鍵診斷報告** — 走完整代理路徑（TCP 連線 → SOCKS5 握手 → 認證 → CONNECT → 資料回流），逐步標示 pass/fail，精確定位故障步驟，並可一鍵複製診斷報告
-- 📶 顯示 Wi-Fi 內網 IP / 熱點分享 IP / 5G 公網 IP，附「刷新狀態」按鈕、上次退出原因（低記憶體、崩潰等）
+- 🔒 **Forced cellular lock** — binds sockets to the 5G network via `NetworkRequest` (`Network.bindSocket`), unaffected by Wi-Fi
+- 🔑 **Optional username/password auth** (RFC 1929) — no auth by default (open proxy); auth is enabled **only when both** username and password are filled in. Leaving either field empty disables it, so blank values can never let arbitrary input through
+- 🧦 **Full SOCKS5 proxy** — native C engine (epoll, concurrent); supports TCP (CONNECT) and UDP (ASSOCIATE), and IPv4 / IPv6 / DOMAIN addresses
+- 🛰️ **Binds LAN interfaces only** — listeners bind only to local network addresses (Wi-Fi / hotspot / USB tethering), plus a local loopback for health checks. **Never exposed on the cellular interface**
+- 🧵 **UDP-in-TCP** — custom extension command `0x04`: UDP relay payload rides the same TCP connection as frames, immune to UDP congestion and priority handling (see the protocol spec below)
+- 🔁 **IPv6-first Happy Eyeballs** — TCP connections race per RFC 8305: IPv6 goes first, IPv4 joins 250 ms later, first success wins (previously a parallel race with an IPv4 preference)
+- ❤️ **20-second heartbeat** — keeps the 5G link from dropping or falling into power save
+- 🛡️ **Native engine health check** — verifies the SOCKS5 server every 10 seconds and restarts it on failure. A built-in stop flag prevents a race with "user pressed stop" from leaving zombie listeners
+- 📢 **Real status reporting** — the service reports its actual state via callback (starting / running / paused / restarting / stopped / failed). The UI never guesses
+- 🔔 **Notification permission** — on Android 13+ the app requests `POST_NOTIFICATIONS` before starting, so the foreground service notification displays properly
+- 🧪 **Built-in SOCKS5 self-test + one-tap diagnostic report** — walks the full proxy path (TCP connect → SOCKS5 handshake → auth → CONNECT → data return) and marks each step pass/fail to pinpoint the failing stage; the diagnostic report copies with one tap
+- 📶 Shows the Wi-Fi LAN IP / hotspot IP / 5G public IP, with a "Refresh status" button and the last exit reason (low memory, crash, etc.)
 
 ---
 
-## 系統需求（編譯環境）
+## Build requirements
 
-| 項目 | 版本 |
+| Item | Version |
 |---|---|
 | JDK | 17+ |
 | Android SDK Platform | 34 (compileSdk) |
 | Android NDK | **26.3.11579264** |
 | CMake | **3.22.1** |
-| Gradle (wrapper) | 8.4（自動下載） |
+| Gradle (wrapper) | 8.4 (downloaded automatically) |
 | Android Gradle Plugin | 8.1.2 |
 | Kotlin | 1.9.20 |
-| 最低 Android 版本 | Android 8.0 (API 26)，需支援蜂巢狀網路與 `requestNetwork()` |
+| Minimum Android version | Android 8.0 (API 26); requires cellular network and `requestNetwork()` support |
 
-> ⚠️ NDK 與 CMake 必須精確安裝 **26.3.11579264** 與 **3.22.1**，否則建置會失敗。
+> ⚠️ NDK and CMake must be installed at exactly **26.3.11579264** and **3.22.1**, otherwise the build fails.
 
 ---
 
-## 編譯教學
+## Building
 
-### 方法一：Android Studio（推薦）
+### Option 1: Android Studio (recommended)
 
-1. 安裝 [Android Studio](https://developer.android.com/studio)（內含 JDK 17）
-2. **SDK Manager**（Settings → Languages & Frameworks → Android SDK → SDK Tools）安裝：
+1. Install [Android Studio](https://developer.android.com/studio) (bundles JDK 17)
+2. In **SDK Manager** (Settings → Languages & Frameworks → Android SDK → SDK Tools) install:
    - **NDK (Side by side) → 26.3.11579264**
    - **CMake → 3.22.1**
-3. 用 Android Studio 開啟 `AndroidProxy` 資料夾，等待 Gradle 同步完成
-4. 選單 **Build → Build App Bundle(s) / APK(s) → Build APK(s)**
-5. APK 位置：`app\build\outputs\apk\debug\app-debug.apk`
+3. Open the `AndroidProxy` folder in Android Studio and wait for Gradle sync to finish
+4. Menu **Build → Build App Bundle(s) / APK(s) → Build APK(s)**
+5. APK location: `app\build\outputs\apk\debug\app-debug.apk`
 
-### 方法二：命令列（無需 Android Studio）
+### Option 2: Command line (no Android Studio needed)
 
 ```powershell
-# 前置需求：JDK 17+、Android SDK、NDK 26.3.11579264、CMake 3.22.1
-# 首次需建立 local.properties（指向你的 SDK 路徑）：
-#   sdk.dir=C:\\Users\\你的使用者\\AppData\\Local\\Android\\Sdk
+# Requires: JDK 17+, Android SDK, NDK 26.3.11579264, CMake 3.22.1
+# Create local.properties once, pointing at your SDK:
+#   sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 
 cd AndroidProxy
 
-# Debug 版（含自動簽名）
+# Debug build (auto-signed)
 .\gradlew.bat assembleDebug
 
-# Release 版（註：目前使用 Debug 簽署，見下方說明）
+# Release build (note: currently debug-signed, see below)
 .\gradlew.bat assembleRelease
 
-# 安裝到已連接的手機
+# Install to a connected device
 .\gradlew.bat installDebug
 ```
 
-- **Windows**：`gradlew.bat`　**macOS / Linux**：`./gradlew`
-- 產出位置：
-  - Debug：`app/build/outputs/apk/debug/app-debug.apk`
-  - Release：`app/build/outputs/apk/release/app-release.apk`
+- **Windows**: `gradlew.bat`　**macOS / Linux**: `./gradlew`
+- Output locations:
+  - Debug: `app/build/outputs/apk/debug/app-debug.apk`
+  - Release: `app/build/outputs/apk/release/app-release.apk`
 
 ---
 
-## 安裝到手機
+## Installing on a phone
 
-1. 手機開啟「開發者選項」→ 開啟「USB 偵錯」
-2. 連接 USB，執行 `adb devices` 確認出現 `device`
-3. 安裝：
+1. On the phone, enable **Developer options** → **USB debugging**
+2. Connect over USB and confirm `adb devices` lists a `device`
+3. Install:
 
 ```powershell
 adb install -r app\build\outputs\apk\debug\app-debug.apk
 ```
 
-4. 安裝完畢後，需要 **使用系統連接受權**（`FOREGROUND_SERVICE_CONNECTED_DEVICE`），App 首次執行會提示允許電池最佳化白名單，建議照提示操作（尤其小米/三星使用者）。
+4. After installing, the app needs the **connected-device foreground service** permission (`FOREGROUND_SERVICE_CONNECTED_DEVICE`). On first launch it prompts you to allow the battery optimization exemption — follow the prompt (especially on Xiaomi/Samsung devices).
 
 ---
 
-## 使用方式
+## Usage
 
-### 拓撲總覽
+### Topology
 
-一台 **5G 行動網路的手機**當「伺服器」就夠了，不需要第二台手機。這台手機安裝 5G-Proxy-Pro，本身就是一個 **SOCKS5 伺服器**，最後的出口一律走這台手機自己的 5G 卡。
+One phone **with a 5G connection** is enough as the "server" — no second phone required. Install 5G-Proxy-Pro on that phone and it becomes a **SOCKS5 server** itself; the final egress is always that phone's own 5G SIM.
 
-**客戶端不限電腦**：任何支援 SOCKS5 的裝置都行——手機/平板用 5G-Proxy-Client 導過去，電腦用 NetRedirector 指定要轉的程式。
+**Clients are not limited to computers**: any SOCKS5-capable device works — phones/tablets via 5G-Proxy-Client, computers via NetRedirector to target specific programs.
 
 ```
-客戶端（手機 / 平板 5G-Proxy-Client、電腦 NetRedirector）
+Client (5G-Proxy-Client on phone/tablet, NetRedirector on PC)
         │ SOCKS5
         ▼
-  手機（5G 代理伺服器）
-        │ 5G 行動網路（強制）
+  Phone (5G proxy server)
+        │ 5G cellular (forced)
         ▼
-      網際網路
+      Internet
 ```
 
-手機（伺服器）與客戶端的連法，以下三種都行：
+All three of the following ways to connect the phone (server) and clients work:
 
-1. **連同一個 WiFi**：手機與客戶端都連上同一台路由器，在同一區網內。
-2. **手機開 WiFi 熱點**：手機自己當 AP，讓其他裝置連它，但不直接上網，而是通過 SOCKS5 上網。
-3. **USB Tethering（USB 網路共用）**：手機用 USB 線接電腦，走 USB 網路共用。缺點是只能連一台裝置；若客戶端裝置要作為伺服器、讓其他裝置繼續往下跳也可以，只是配置較麻煩。
+1. **Same Wi-Fi**: the phone and clients connect to the same router, on the same LAN.
+2. **Phone Wi-Fi hotspot**: the phone acts as the AP and other devices connect to it — but they don't go online directly, they go through SOCKS5.
+3. **USB tethering**: connect the phone to a computer over USB and use USB tethering. Downside: only one device can connect. You can chain further (make the client device a server for others), but the configuration is more involved.
 
-> 💡 不管手機用哪種方式跟客戶端連，**經由 SOCKS5 代理出去的流量全都走手機自己的 5G 行動網路**——這是 5G-Proxy-Pro 強制的。若手機本身連著 WiFi 上網，本機雖優先使用 WiFi 線路，但代理出去的流量一律走 5G。
+> 💡 Whichever way the phone and clients are connected, **all traffic leaving through the SOCKS5 proxy uses the phone's own 5G connection** — 5G-Proxy-Pro enforces this. If the phone itself is online over Wi-Fi, its local traffic prefers Wi-Fi, but proxied traffic always goes over 5G.
 
-### 操作步驟
+### Steps
 
-1. 開啟 App（5G Proxy Pro）
-2. 輸入代理連接埠（預設 `1080`）
-3. （可選）輸入「使用者」與「密碼」——**兩者都留空 = 無認證（開放代理）**；**兩者都填寫**才會啟用認證（RFC 1929），任一欄位留空即為無認證。**代理運行中修改帳密會即時套用**（新連線生效，已連線的舊連線不受影響），不需停止重啟
-4. Android 13+ 首次啟動會請求**通知權限**，允許後前景服務通知才能正常顯示（拒絕仍可運行，App 會提示）
-5. 點「🚀 Start 5G Proxy」，等待狀態顯示「✅ 5G Proxy Running」
-6. 在同一個 Wi-Fi 下的其他裝置設定 SOCKS5 代理（例如手機 Wi-Fi 進階設定，或電腦系統 Proxy 設定）：
+1. Open the app (5G Proxy Pro)
+2. Enter the proxy port (default `1080`)
+3. (Optional) enter a username and password — **both empty = no auth (open proxy)**; **both filled** enables auth (RFC 1929), and leaving either empty means no auth. **Changing credentials while the proxy is running applies immediately** (new connections only; existing connections are unaffected) with no stop/restart needed
+4. On Android 13+ the first launch requests **notification permission**; allow it so the foreground service notification displays (denying still works, and the app will tell you)
+5. Tap "🚀 Start 5G Proxy" and wait for the status to show "✅ 5G Proxy Running"
+6. Configure a SOCKS5 proxy on the other devices on the same Wi-Fi (e.g. the phone's advanced Wi-Fi settings, or the system proxy settings on a computer):
 
 ```
-伺服器：手機的 Wi-Fi IP（App 會顯示）
-連接埠：1080
-通訊協定：SOCKS5
-使用者名稱：<有設定才需要填>
-密碼：<有設定才需要填>
+Server: the phone's Wi-Fi IP (shown in the app)
+Port: 1080
+Protocol: SOCKS5
+Username: <only if you set one>
+Password: <only if you set one>
 ```
 
-> ⚠️ 若未設定帳密即為開放代理，任何能連到手機位址的人都能使用。請務必只在信任的區域網路使用，或設定帳密保護！
+> ⚠️ Without credentials this is an open proxy: anyone who can reach the phone's address can use it. Only run it on a trusted LAN, or protect it with credentials!
 >
-> ℹ️ 代理監聽器**只綁定 LAN 介面**（Wi-Fi / 熱點 / USB 分享，另有本機 loopback 供健康檢查），無法從行動網路介面存取；若裝置沒有任何可用 LAN 介面，啟動會失敗並顯示錯誤訊息。
+> ℹ️ The proxy listeners **bind LAN interfaces only** (Wi-Fi / hotspot / USB tethering, plus local loopback for health checks) and cannot be reached over the cellular interface. If the device has no usable LAN interface, startup fails with an error message.
 
-停止方式：回到 App 點「🛑 Stop Proxy Service」。停止後所有監聽器會立即關閉、Port 完全釋放，且不會被系統或健康檢查悄悄重啟（v1.4.0 起）。
+To stop: go back to the app and tap "🛑 Stop Proxy Service". All listeners close immediately, the port is fully released, and neither the system nor the health check will quietly restart it (since v1.4.0).
 
 ---
 
-## 專案架構
+## Project layout
 
 ```
 AndroidProxy/
 ├── app/src/main/
 │   ├── java/com/tokyoxpa3/androidproxy/
-│   │   ├── DebugActivity.kt           # 主介面 + 自我檢測 + 熱點 IP 顯示
-│   │   ├── Socks5ProxyService.kt     # 前台服務：鎖定 5G、啟動 C 引擎
-│   │   ├── NativeEngine.kt           # JNI 橋接（socketProvider 回呼）
-│   │   ├── SelfTest.kt               # 內建自我檢測（走完整代理路徑）
-│   │   ├── Socks5ClientProtocol.kt   # 自我檢測用的 SOCKS5 客戶端協定（純函式）
-│   │   ├── DnsCache.kt               # DNS 快取 + single-flight（純協調邏輯）
-│   │   ├── HappyEyeballs.kt          # RFC 8305 連線競速（純決策邏輯）
-│   │   ├── IpLiteral.kt              # IP 字面值判斷（不觸發 DNS）
-│   │   ├── PowerPermissionHelper.kt  # 各品牌電池最佳化白名單引導
+│   │   ├── DebugActivity.kt           # Main screen + self-test + hotspot IP display
+│   │   ├── Socks5ProxyService.kt     # Foreground service: lock 5G, start the C engine
+│   │   ├── NativeEngine.kt           # JNI bridge (socketProvider callbacks)
+│   │   ├── SelfTest.kt               # Built-in self-test (walks the full proxy path)
+│   │   ├── Socks5ClientProtocol.kt   # SOCKS5 client protocol for self-test (pure functions)
+│   │   ├── DnsCache.kt               # DNS cache + single-flight (pure coordination logic)
+│   │   ├── HappyEyeballs.kt          # RFC 8305 connection racing (pure decision logic)
+│   │   ├── IpLiteral.kt              # IP literal detection (never triggers DNS)
+│   │   ├── PowerPermissionHelper.kt  # Per-vendor battery optimization guidance
 │   │   └── network/
-│   │       ├── CellularNetworkManager.kt  # requestNetwork() 鎖定與釋放
-│   │       ├── PublicIPChecker.kt         # 5G 公網 IP 查詢
-│   │       └── HotspotManager.kt          # 熱點分享 IP 偵測
+│   │       ├── CellularNetworkManager.kt  # requestNetwork() acquire/release
+│   │       ├── PublicIPChecker.kt         # 5G public IP lookup
+│   │       └── HotspotManager.kt          # Hotspot IP detection
 │   └── cpp/
-│       ├── jni_bridge.c         # JNI 註冊、Java↔C 呼叫橋樑
-│       ├── simple-socks5.c      # epoll SOCKS5 引擎（TCP/UDP）
-│       ├── socks5_protocol.h    # 純協定解析/封裝宣告（TCP 握手 + UDP datagram，host 可測）
-│       ├── socks5_protocol.c    # 純協定解析/封裝實作（零 socket 依賴）
+│       ├── jni_bridge.c         # JNI registration, Java↔C bridge
+│       ├── simple-socks5.c      # epoll SOCKS5 engine (TCP/UDP)
+│       ├── socks5_protocol.h    # Pure protocol parse/build declarations (TCP handshake + UDP datagram, host-testable)
+│       ├── socks5_protocol.c    # Pure protocol parse/build implementation (zero socket dependencies)
 │       └── CMakeLists.txt
 ```
 
-### 流量路徑
+### Traffic path
 
 ```
-[客戶端] --SOCKS5--> [App: C 引擎簡單] --JNI--> [Java: Network.bindSocket(5G)] --> [電信網路]
+[Client] --SOCKS5--> [App: C engine] --JNI--> [Java: Network.bindSocket(5G)] --> [Carrier network]
 ```
 
-C 引擎收到客戶端連線後，透過 JNI 呼叫 Java `createSocketBoundToNetwork()`，使用電子網路專屬的 Socket 進行真正的資料傳輸，確保所有流量走 5G/蜂巢狀，而非 Wi-Fi。
+When the C engine accepts a client connection it calls Java's `createSocketBoundToNetwork()` over JNI and uses a socket dedicated to the cellular network for the actual data transfer, guaranteeing that all traffic goes over 5G/cellular rather than Wi-Fi.
 
 ---
 
-## UDP-in-TCP 協定規格（自訂擴充指令 0x04）
+## UDP-in-TCP protocol spec (custom extension command 0x04)
 
-標準 SOCKS5 的 UDP relay 走獨立的 UDP 通道（UDP ASSOCIATE）；本伺服器另支援自訂指令 `0x04`「UDP ASSOCIATE over TCP」，UDP 資料以 frame 形式走**同一條 TCP 控制連線**，避免 UDP 在壅塞網路上被丟棄、以及 NAT/防火牆對 UDP 的影響。
+Standard SOCKS5 UDP relay uses a separate UDP channel (UDP ASSOCIATE); this server additionally supports a custom command `0x04` ("UDP ASSOCIATE over TCP") where UDP payloads ride **the same TCP control connection** as frames. This avoids UDP being dropped on congested networks and sidesteps NAT/firewall problems with UDP.
 
-### 握手
+### Handshake
 
 ```
-Client → Server: {0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0}   （SOCKS5 request，cmd=0x04）
-Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功回覆，BND 全 0）
+Client → Server: {0x05, 0x04, 0x00, 0x01, 0,0,0,0, 0,0}   (SOCKS5 request, cmd=0x04)
+Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT} (standard success reply, BND all zero)
 ```
 
-成功回覆後，同一條 TCP 連線雙向以 frame 承載 UDP datagram。
+After a successful reply, both directions of the same TCP connection carry UDP datagrams as frames.
 
-若伺服器回覆 `REP≠0`（不支援 0x04，或**暫時拒絕**——例如連線額度／UDP slot 耗盡、5G UDP socket 建不起來），伺服器會依 RFC 1928 送完失敗回覆後**直接關閉該條 TCP 連線**。因此客戶端**必須另開一條新連線**再退回標準 `0x03`（UDP ASSOCIATE）；續用原連線只會拿到 EOF，而且那個失敗會被誤判成網路斷線，觸發客戶端不必要的自動重連。
+If the server replies `REP≠0` (0x04 unsupported, or **temporarily refusing** — e.g. connection or UDP slot exhaustion, or failure to create the 5G UDP socket), it sends the RFC 1928 failure reply and then **closes that TCP connection immediately**. The client **must therefore open a new connection** before falling back to standard `0x03` (UDP ASSOCIATE); reusing the original connection only yields EOF, and that failure gets misread as a network drop, triggering unnecessary automatic reconnects on the client.
 
-失敗回覆的 REP 語意：
+REP semantics for failure replies:
 
-| REP | 意義 | 伺服器端情境 |
+| REP | Meaning | Server-side situation |
 |---|---|---|
-| `0x01` | general SOCKS server failure | 連線數達 `MAX_CONCURRENT_CONNS`，或 UDP slot 用盡（**伺服器資源耗盡**，非目標問題） |
-| `0x04` | host unreachable | 目標不可達，含 5G 出口 UDP socket 建置失敗 |
+| `0x01` | general SOCKS server failure | `MAX_CONCURRENT_CONNS` reached, or UDP slots exhausted (**server resource exhaustion**, not a target problem) |
+| `0x04` | host unreachable | Target unreachable, including failure to create the 5G egress UDP socket |
 
-客戶端宜把兩者都歸類為**伺服器端拒絕／忙碌**（協定層），而非網路層斷線。
+Clients should classify both as **server-side refusal/busy** (protocol layer), not as a network-layer disconnect.
 
-### Frame 格式（雙向相同）
+### Frame format (identical in both directions)
 
 ```
 +--------+--------+-----...------+
@@ -217,8 +217,8 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 +--------+--------+---------------------+
 ```
 
-- `len`：16-bit **network order**，為後方 datagram 的總位元組數（不含長度欄本身）
-- datagram 採用標準 SOCKS5 UDP header：
+- `len`: 16-bit **network order**, the total byte count of the following datagram (excluding the length field itself)
+- The datagram uses the standard SOCKS5 UDP header:
 
 ```
 +----+------+------+----------+----------+----------+
@@ -227,61 +227,61 @@ Server → Client: {0x05, 0x00, 0x00, 0x01, BND.ADDR, BND.PORT}（標準成功�
 | 2  |  1   |  1   | Variable |    2     | Variable |
 ```
 
-- `RSV=0`、`FRAG=0`
-- `ATYP=0x01`（IPv4，表頭 10B）、`ATYP=0x04`（IPv6，表頭 22B）或 `ATYP=0x03`（網域，表頭 `4 + 1 + len + 2`，可變長）
-  - `ATYP=0x03` 是 RFC 1928 §7 明文允許的 —— UDP request header 的 `ATYP` 與 §5 的 TCP CONNECT 共用同一組定義（0x01/0x03/0x04）。5G-Proxy-Client 開啟 **Remote DNS** 時，客戶端手上只有 fake IP、真名必須由伺服器以**自身出口**解析，送出的就是網域 frame；只認 0x01/0x04 會讓這類 frame 被靜默丟棄（QUIC 等 UDP 全滅）
-  - 伺服器端以**蜂巢式網路**解析（`Socks5ProxyService.resolveWithCache`：IP 字面值快路徑 + 共用快取 + `DnsResolver` 逾時 + 併發背壓），**不走系統 `getaddrinfo`** —— 那會用預設網路，在 Pro 手機上可能繞回 VPN。解析結果有 60 秒 TTL 快取（`simple-socks5.c` 的 `resolve_domain_sockaddr`）；解析失敗則丟棄該 frame 並記錄 log
-- 伺服器收到 frame 後解析目標位址，以 5G socket `sendto`；收到 5G 回覆後以來源位址封裝為 frame 送回客戶端（v4-mapped 一律輸出 ATYP=0x01）
+- `RSV=0`, `FRAG=0`
+- `ATYP=0x01` (IPv4, 10-byte header), `ATYP=0x04` (IPv6, 22-byte header), or `ATYP=0x03` (domain, header `4 + 1 + len + 2`, variable length)
+  - `ATYP=0x03` is explicitly allowed by RFC 1928 §7 — the `ATYP` in the UDP request header shares the same definition (0x01/0x03/0x04) as §5 TCP CONNECT. With **Remote DNS** enabled in 5G-Proxy-Client the client only holds a fake IP, and the real name must be resolved by the server **using its own egress**, so the frames it sends are domain-typed; accepting only 0x01/0x04 would silently drop them, killing all UDP including QUIC
+  - The server resolves via the **cellular network** (`Socks5ProxyService.resolveWithCache`: IP-literal fast path + shared cache + `DnsResolver` timeout + concurrency backpressure) and **never uses the system `getaddrinfo`** — that uses the default network, which on a Pro phone may route back through the VPN. Results are cached with a 60-second TTL (`resolve_domain_sockaddr` in `simple-socks5.c`); on resolution failure the frame is dropped and logged
+- On receiving a frame the server resolves the target address and `sendto`s it over the 5G socket; replies from 5G are wrapped as frames using the source address and sent back to the client (v4-mapped is always emitted as ATYP=0x01)
 
-### 實作位置
+### Implementation
 
-- `app/src/main/cpp/simple-socks5.c` → `handle_udp_tcp_session()`（`handle_handshake` 分派 cmd==0x04）
+- `app/src/main/cpp/simple-socks5.c` → `handle_udp_tcp_session()` (`handle_handshake` dispatches cmd==0x04)
 
-### 搭配客戶端
+### Client pairing
 
-- 5G-Proxy-Client 勾選「UDP relay 走 TCP（UDP-in-TCP）」即使用本協定；對一般 SOCKS5 伺服器會自動退回標準協定，兩者皆可互通。
-- 客戶端開啟 **Remote DNS** 時，UDP frame 會帶 `ATYP=0x03`（網域），需要伺服器端配合解析 —— 見上方 Frame 格式第 3 點。
-- 退回標準 `0x03` 時客戶端會**重新建立一條連線**（本伺服器在回覆 `REP≠0` 後會關閉原連線），並把該次失敗歸類為協定層、**不觸發**自動重連看門狗。因此「勾了 UDP-in-TCP 就無法連線」在客戶端舊版是個會引發重啟迴圈的 bug；伺服器端的職責只有「誠實回覆 `REP≠0` 並關閉」。
+- 5G-Proxy-Client uses this protocol when "UDP relay over TCP (UDP-in-TCP)" is checked; against a plain SOCKS5 server it falls back to the standard protocol automatically, so both interoperate.
+- With **Remote DNS** enabled on the client, UDP frames carry `ATYP=0x03` (domain) and require server-side resolution — see point 3 under Frame format above.
+- When falling back to standard `0x03` the client **opens a new connection** (this server closes the original after replying `REP≠0`) and classifies that failure as protocol-layer, **without** triggering its auto-reconnect watchdog. So "can't connect once UDP-in-TCP is checked" was a client-side bug in older versions that caused a restart loop; the server's only responsibility is to **honestly reply `REP≠0` and close**.
 
 ---
 
-## 注意事項
+## Notes
 
-- **Release 版預設不簽名**：若要自行發布 APK，請在專案根目錄建立 `keystore.properties`（格式見下方），並準備一個正式 keystore；若沒有該檔案，Release 版會輸出未簽名的 APK，供 F-Droid 等第三方以自身金鑰簽署。
-- App 僅於「鎖定蜂巢狀網路」的狀態下運作，若沒有蜂巢狀訊號（無 SIM 卡）服務將無法啟動。
-- **可與本機 VPN 同時運作，前提是本 App 被排除在 VPN 之外**：啟動時會實際嘗試把 Socket 綁定到蜂巢式出口（`Network.bindSocket`），**bind 成功才啟動**，失敗才拒絕並提示原因。「系統裡有 VPN」本身不再是拒絕啟動的理由 —— per-app VPN（split tunneling）未包含本 App 時，蜂巢式出口完全可用。
-  - 若本 App 被納入 VPN 隧道，`bindSocket` 會被系統以 `EPERM` 拒絕。此時請在 VPN 的「分應用 / 排除清單」中**排除本 App**（套件名 `com.tokyoxpa3.androidproxy`），而**不是**關閉 VPN —— 關掉 VPN 就等於放棄整個用途。
-  - 同機並存的實例：本 App 連著 Wi-Fi 提供 5G 代理時，同一支手機再跑 5G-Proxy-Client（伺服器位址填本 App 顯示的「Wi-Fi 代理」IP）並把本 App 排除在隧道外，即可讓手機自身的流量也走 5G。詳見 5G-Proxy-Client 的 `TUTORIAL.md`。
-  - 被 VPN 阻擋時（bind 被拒且蜂巢式仍經系統驗證可用）健康檢查會標示 `BLOCKED_BY_VPN` 並**刻意不自動重建** —— 重啟解決不了設定問題，只會陷入重啟迴圈；真正的斷線則仍走原本的「連續 3 次失敗自動重建」。
-- 專案包含 `local.properties`（SDK 路徑）與 `.gradle/`、`build/`、`.cxx/` 等產生目錄，這些已被 `.gitignore` 忽略，不會上傳。
+- **Release builds are unsigned by default**: to publish an APK yourself, create `keystore.properties` in the project root (format below) and prepare a real keystore. Without that file the release build emits an unsigned APK, for third parties such as F-Droid to sign with their own key.
+- The app only works while the cellular network is locked; without cellular signal (no SIM) the service cannot start.
+- **It can coexist with an on-device VPN, provided this app is excluded from it**: at startup it actually attempts to bind a socket to the cellular egress (`Network.bindSocket`) and **only starts if the bind succeeds**, refusing with a reason otherwise. "There is a VPN on the system" is no longer a reason to refuse startup by itself — when per-app VPN (split tunneling) does not include this app, the cellular egress is fully usable.
+  - If this app is inside the VPN tunnel, the system rejects `bindSocket` with `EPERM`. In that case **exclude this app** (package `com.tokyoxpa3.androidproxy`) in the VPN's per-app/exclusion list, rather than turning the VPN off — turning it off means giving up the entire point.
+  - Same-device example: while this app serves a 5G proxy over Wi-Fi, also run 5G-Proxy-Client on the same phone (server address = the "Wi-Fi proxy" IP shown by this app) and exclude this app from the tunnel, and the phone's own traffic goes over 5G too. See `TUTORIAL.md` in 5G-Proxy-Client.
+  - When blocked by a VPN (bind rejected while cellular is still system-validated as available) the health check reports `BLOCKED_BY_VPN` and **deliberately does not auto-rebuild** — restarting cannot fix a configuration problem and only causes a restart loop; genuine disconnects still follow the existing "auto-rebuild after 3 consecutive failures".
+- The project contains `local.properties` (SDK path) and generated directories such as `.gradle/`, `build/`, `.cxx/`; these are covered by `.gitignore` and never uploaded.
 
-## 網路使用說明
+## Network usage
 
-代理服務本身**只做本機監聽與轉送**，不會自行對外連線；以下情況會產生對外連線：
+The proxy service itself **only listens and forwards locally** and never initiates outbound connections on its own; outbound connections occur in the following cases:
 
-| 功能 | 目的地 | 時機 |
+| Feature | Destination | When |
 |---|---|---|
-| 原生引擎健康檢查 | `connectivitycheck.gstatic.com` / `captive.apple.com` / `connect.rom.miui.com`（依序備援，透過 5G） | 每 10 秒，驗證伺服器存活 |
-| 公網 IP 顯示 | `api.ipify.org` | 按下「刷新狀態」時 |
-| 自我檢測 | example.com（透過 5G 代理） | 僅在點擊「自我檢測」時 |
+| Native engine health check | `connectivitycheck.gstatic.com` / `captive.apple.com` / `connect.rom.miui.com` (fallback in order, over 5G) | Every 10 seconds, to verify the server is alive |
+| Public IP display | `api.ipify.org` | When you tap "Refresh status" |
+| Self-test | example.com (through the 5G proxy) | Only when you tap "Self Test" |
 
-所有代理流量（客戶端透過 SOCKS5 轉送）都經由鎖定的蜂巢式網路介面輸出。
+All proxied traffic (what clients relay over SOCKS5) egresses through the locked cellular interface.
 
-### Release 簽名設定（自行發布時）
+### Release signing (when publishing yourself)
 
-在專案根目錄建立 `keystore.properties`（已被 `.gitignore` 忽略，不會上傳）：
+Create `keystore.properties` in the project root (gitignored, never uploaded):
 
 ```properties
 storeFile=C:/path/to/your-release.keystore
-storePassword=你的儲存庫密碼
-keyAlias=你的金鑰別名
-keyPassword=你的金鑰密碼
+storePassword=<your keystore password>
+keyAlias=<your key alias>
+keyPassword=<your key password>
 ```
 
-之後執行 `.\gradlew.bat assembleRelease` 即會以正式金鑰簽名。
+After that, `.\gradlew.bat assembleRelease` signs with the real key.
 
 ---
 
-## 授權
+## License
 
-本專案以 **MIT License** 授權釋出，詳見 [LICENSE](LICENSE)。
+This project is released under the **MIT License**; see [LICENSE](LICENSE).
